@@ -25,7 +25,7 @@ A modern, customizable clock application with a beautiful dot-matrix display, we
 
 1. **Clone the repository**:
    ```bash
-   git clone https://github.com/yourusername/NdotClock.git
+   git clone https://github.com/Mio-of/NdotClock.git
    cd NdotClock
    ```
 
