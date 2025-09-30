@@ -1,0 +1,35 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+
+# Cookies and browser profiles
+cookies/
+
+# Settings (now stored in user config directories)
+ndot_clock_slider_settings.json
+
+# IDE
+.vscode/
+.idea/
+.claude/
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# OS specific
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# PyInstaller
+*.spec
+dist/
+build/

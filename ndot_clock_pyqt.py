@@ -38,7 +38,6 @@ class AnimatedSlideContainer(QWidget):
         self._offset_x = 0.0
         self._scale = 1.0
         self._offset_y = 0.0
-        
     def get_offset_x(self) -> float:
         return self._offset_x
     
@@ -448,6 +447,12 @@ class NDotClockSlider(QWidget):
         self.nav_hidden = False
         self.nav_hide_timer = QTimer(self)
         self.nav_hide_timer.timeout.connect(self.hide_navigation)
+        self._nav_opacity = 1.0
+        self.nav_opacity_animation = QPropertyAnimation(self)
+        self.nav_opacity_animation.setTargetObject(self)
+        self.nav_opacity_animation.setPropertyName(b"navOpacity")
+        self.nav_opacity_animation.setDuration(300)
+        self.nav_opacity_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._edit_panel_ratios: Optional[Tuple[float, float]] = None
         self._youtube_opened_slides: Set[int] = set()  # Track which YouTube slides were auto-opened
         self.youtube_webview: Optional[QWebEngineView] = None  # Embedded browser for YouTube
@@ -922,6 +927,20 @@ class NDotClockSlider(QWidget):
         self.panel_opacity_animation.start()
         self.panel_scale_animation.start()
 
+    def get_nav_opacity(self) -> float:
+        """Return current navigation opacity."""
+        return self._nav_opacity
+
+    def set_nav_opacity(self, value: float):
+        """Set navigation opacity and trigger repaint."""
+        value = max(0.0, min(1.0, float(value)))
+        if math.isclose(self._nav_opacity, value, abs_tol=0.001):
+            return
+        self._nav_opacity = value
+        self.update()
+
+    navOpacity = pyqtProperty(float, fget=get_nav_opacity, fset=set_nav_opacity)
+
     def reset_navigation_timer(self):
         """Reset the navigation inactivity timer"""
         if not self.edit_mode:
@@ -930,15 +949,27 @@ class NDotClockSlider(QWidget):
 
     def show_navigation(self):
         """Show navigation dots"""
-        if self.nav_hidden:
-            self.nav_hidden = False
-            self.update()
+        self.nav_hidden = False
+        if self.nav_opacity_animation.state() == QPropertyAnimation.State.Running:
+            self.nav_opacity_animation.stop()
+        self.nav_opacity_animation.setStartValue(self._nav_opacity)
+        self.nav_opacity_animation.setEndValue(1.0)
+        self.nav_opacity_animation.start()
+        self.update()
 
     def hide_navigation(self):
         """Hide navigation dots"""
-        if not self.edit_mode and not self.nav_hidden:
-            self.nav_hidden = True
-            self.update()
+        if self.edit_mode:
+            return
+        if self.nav_hidden and math.isclose(self._nav_opacity, 0.0, abs_tol=0.001):
+            return
+        self.nav_hidden = True
+        if self.nav_opacity_animation.state() == QPropertyAnimation.State.Running:
+            self.nav_opacity_animation.stop()
+        self.nav_opacity_animation.setStartValue(self._nav_opacity)
+        self.nav_opacity_animation.setEndValue(0.0)
+        self.nav_opacity_animation.start()
+        self.update()
 
     def fetch_location(self):
         """Fetch location from IP geolocation API (HTTPS)"""
@@ -2949,7 +2980,7 @@ class NDotClockSlider(QWidget):
         if self.edit_mode and not self.card_edit_mode:
             self.draw_edit_mode_ui(painter)
         
-        if not self.edit_mode and not self.nav_hidden:
+        if not self.edit_mode and (not self.nav_hidden or self._nav_opacity > 0.0):
             self.draw_navigation_dots(painter)
 
     def draw_slides_normal_mode(self, painter: QPainter):
@@ -3488,6 +3519,12 @@ class NDotClockSlider(QWidget):
 
     def draw_navigation_dots(self, painter: QPainter):
         """Draw navigation dots"""
+        if self._nav_opacity <= 0.0:
+            return
+
+        painter.save()
+        painter.setOpacity(self._nav_opacity)
+
         dot_width = int(22 * self.scale_factor)
         dot_height = int(6 * self.scale_factor)
         dot_spacing = int(12 * self.scale_factor)
@@ -3507,6 +3544,8 @@ class NDotClockSlider(QWidget):
                 painter.setBrush(QColor(70, 70, 70))
 
             painter.drawRoundedRect(x, y, dot_width, dot_height, radius, radius)
+
+        painter.restore()
 
     def draw_edit_mode_ui(self, painter: QPainter):
         """Draw edit mode UI elements"""
