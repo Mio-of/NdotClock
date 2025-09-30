@@ -2,8 +2,7 @@
 
 A modern, customizable clock application with a beautiful dot-matrix display, weather widget, and web integration support.
 
-![N-Dot Clock]([<img width="1600" height="960" alt="_C__Users_Mio_Documents_py%20ver_improved_ndot_clock html (4)" src="https://github.com/user-attachments/assets/11f18d62-d1c0-459f-aa89-4e8c8d55e1be" />](https://github.com/Mio-of/NdotClock/blob/main/resources/partly%20cloudy%20day.svg)
-)
+<img width="1600" height="960" alt="_C__Users_Mio_Documents_py%20ver_improved_ndot_clock html (4)" src="https://github.com/user-attachments/assets/80482538-6a35-429f-9b15-83d974848c34" />
 
 ## Features
 
