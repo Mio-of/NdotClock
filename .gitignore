@@ -33,3 +33,4 @@ desktop.ini
 *.spec
 dist/
 build/
+ndot_clock_pyqt.py.backup

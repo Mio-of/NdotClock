@@ -36,9 +36,7 @@ class UpdateChecker:
         self.parent = parent_widget
         self.network_manager = QNetworkAccessManager()
         self.network_manager.finished.connect(self._on_update_check_finished)
-        self.current_request_type = None  # 'check', 'version_check', or 'download'
-        self.download_progress_popup = None
-        self.latest_version_info = None
+        self.current_request_type = None  # 'check' or 'download'
 
     def check_for_updates(self, silent: bool = False):
         """Check for updates from GitHub main branch
@@ -57,16 +55,7 @@ class UpdateChecker:
     def _on_update_check_finished(self, reply: QNetworkReply):
         """Handle update check response"""
         if reply.error() != QNetworkReply.NetworkError.NoError:
-            if self.current_request_type == 'download':
-                # Download failed
-                if self.download_progress_popup:
-                    self.download_progress_popup.close()
-                self.parent.show_notification(
-                    f"Download failed: {reply.errorString()}",
-                    duration=4000,
-                    notification_type="error"
-                )
-            elif not self.silent and self.current_request_type == 'check':
+            if not self.silent and self.current_request_type == 'check':
                 self.parent.show_notification(
                     f"Failed to check for updates: {reply.errorString()}",
                     duration=4000,
@@ -76,13 +65,7 @@ class UpdateChecker:
             return
 
         try:
-            if self.current_request_type == 'download':
-                # Download completed - install update
-                self._install_update(reply.readAll().data())
-                reply.deleteLater()
-                return
-
-            elif self.current_request_type == 'check':
+            if self.current_request_type == 'check':
                 # Parse commit info
                 data = json.loads(reply.readAll().data().decode('utf-8'))
                 commit_sha = data.get('sha', '')[:7]  # Short SHA
@@ -175,112 +158,19 @@ class UpdateChecker:
             return 0
 
     def _show_update_dialog(self, version: str, commit_url: str, commit_message: str, commit_date: str):
-        """Show update available dialog with auto-update option"""
+        """Show update available dialog"""
         message = f"New version {version} available!\nCurrent: {__version__}\n\n{commit_message}"
 
-        # Store version info for download
-        self.latest_version_info = {
-            'version': version,
-            'url': commit_url,
-            'message': commit_message
-        }
-
         def on_confirm():
-            self.start_download_update()
+            webbrowser.open(f"https://github.com/{__github_repo__}")
 
         self.parent.show_confirmation(
             "Update Available",
             message,
             on_confirm,
-            confirm_text="Download & Install",
+            confirm_text="Open GitHub",
             cancel_text="Later"
         )
-
-    def start_download_update(self):
-        """Start downloading the update"""
-        # Show download progress popup
-        self.download_progress_popup = DownloadProgressPopup(self.parent)
-        self.download_progress_popup.show()
-        self.download_progress_popup.set_status("Connecting to GitHub...")
-
-        # Start download
-        self.current_request_type = 'download'
-        request = QNetworkRequest(QUrl(__github_raw_url__))
-        request.setHeader(QNetworkRequest.KnownHeaders.UserAgentHeader, f"NdotClock/{__version__}")
-
-        reply = self.network_manager.get(request)
-        reply.downloadProgress.connect(self._on_download_progress)
-
-    def _on_download_progress(self, bytes_received: int, bytes_total: int):
-        """Update download progress"""
-        if bytes_total > 0 and self.download_progress_popup:
-            progress = int((bytes_received / bytes_total) * 100)
-            self.download_progress_popup.set_progress(progress)
-
-            # Format size
-            mb_received = bytes_received / (1024 * 1024)
-            mb_total = bytes_total / (1024 * 1024)
-            self.download_progress_popup.set_status(f"Downloading... {mb_received:.1f} MB / {mb_total:.1f} MB")
-
-    def _install_update(self, new_file_data: bytes):
-        """Install the downloaded update"""
-        import shutil
-        import subprocess
-
-        if self.download_progress_popup:
-            self.download_progress_popup.set_progress(100)
-            self.download_progress_popup.set_status("Installing update...")
-
-        try:
-            # Get current script path
-            current_file = os.path.abspath(__file__)
-
-            # Create backup
-            backup_file = current_file + '.backup'
-            if self.download_progress_popup:
-                self.download_progress_popup.set_status("Creating backup...")
-
-            shutil.copy2(current_file, backup_file)
-
-            # Write new file
-            if self.download_progress_popup:
-                self.download_progress_popup.set_status("Writing new version...")
-
-            with open(current_file, 'wb') as f:
-                f.write(new_file_data)
-
-            # Close progress popup
-            if self.download_progress_popup:
-                self.download_progress_popup.close()
-
-            # Show restart confirmation
-            def on_restart():
-                # Restart the application
-                python = sys.executable
-                subprocess.Popen([python, current_file])
-                QApplication.quit()
-
-            self.parent.show_confirmation(
-                "Update Installed",
-                f"Update to version {self.latest_version_info['version']} installed successfully!\n\nRestart the application to apply changes.",
-                on_restart,
-                confirm_text="Restart Now",
-                cancel_text="Later"
-            )
-
-        except Exception as e:
-            # Restore backup if installation failed
-            if os.path.exists(backup_file):
-                shutil.copy2(backup_file, current_file)
-
-            if self.download_progress_popup:
-                self.download_progress_popup.close()
-
-            self.parent.show_notification(
-                f"Update installation failed: {str(e)}",
-                duration=5000,
-                notification_type="error"
-            )
 
 
 class NotificationPopup(QWidget):
@@ -375,8 +265,11 @@ class DownloadProgressPopup(QWidget):
 
     def __init__(self, parent):
         super().__init__(parent)
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool)
+        # Don't use Tool flag - keep it as a child widget
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        # Raise to top of parent's children
+        self.raise_()
 
         # Semi-transparent background overlay
         self.overlay = QWidget(self)
@@ -479,8 +372,11 @@ class ConfirmationPopup(QWidget):
 
     def __init__(self, parent, title: str, message: str, confirm_text: str = "Yes", cancel_text: str = "No"):
         super().__init__(parent)
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool)
+        # Don't use Tool flag - keep it as a child widget
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        # Raise to top of parent's children
+        self.raise_()
 
         # Semi-transparent background overlay
         self.overlay = QWidget(self)
@@ -1836,6 +1732,7 @@ class NDotClockSlider(QWidget):
         if (update_x <= pos.x() <= update_x + update_button_width and
             lang_y <= pos.y() <= lang_y + lang_button_height):
             # Check for updates manually
+            self.show_notification("Checking for updates...", duration=2000, notification_type="info")
             self.update_checker.check_for_updates(silent=False)
             return True
 
