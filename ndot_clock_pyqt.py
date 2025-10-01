@@ -36,7 +36,9 @@ class UpdateChecker:
         self.parent = parent_widget
         self.network_manager = QNetworkAccessManager()
         self.network_manager.finished.connect(self._on_update_check_finished)
-        self.current_request_type = None  # 'check' or 'download'
+        self.current_request_type = None  # 'check', 'version_check', or 'download'
+        self.download_progress_popup = None
+        self.latest_version_info = None
 
     def check_for_updates(self, silent: bool = False):
         """Check for updates from GitHub main branch
@@ -55,7 +57,16 @@ class UpdateChecker:
     def _on_update_check_finished(self, reply: QNetworkReply):
         """Handle update check response"""
         if reply.error() != QNetworkReply.NetworkError.NoError:
-            if not self.silent and self.current_request_type == 'check':
+            if self.current_request_type == 'download':
+                # Download failed
+                if self.download_progress_popup:
+                    self.download_progress_popup.close()
+                self.parent.show_notification(
+                    f"Download failed: {reply.errorString()}",
+                    duration=4000,
+                    notification_type="error"
+                )
+            elif not self.silent and self.current_request_type == 'check':
                 self.parent.show_notification(
                     f"Failed to check for updates: {reply.errorString()}",
                     duration=4000,
@@ -65,7 +76,13 @@ class UpdateChecker:
             return
 
         try:
-            if self.current_request_type == 'check':
+            if self.current_request_type == 'download':
+                # Download completed - install update
+                self._install_update(reply.readAll().data())
+                reply.deleteLater()
+                return
+
+            elif self.current_request_type == 'check':
                 # Parse commit info
                 data = json.loads(reply.readAll().data().decode('utf-8'))
                 commit_sha = data.get('sha', '')[:7]  # Short SHA
@@ -158,19 +175,112 @@ class UpdateChecker:
             return 0
 
     def _show_update_dialog(self, version: str, commit_url: str, commit_message: str, commit_date: str):
-        """Show update available dialog"""
+        """Show update available dialog with auto-update option"""
         message = f"New version {version} available!\nCurrent: {__version__}\n\n{commit_message}"
 
+        # Store version info for download
+        self.latest_version_info = {
+            'version': version,
+            'url': commit_url,
+            'message': commit_message
+        }
+
         def on_confirm():
-            webbrowser.open(f"https://github.com/{__github_repo__}")
+            self.start_download_update()
 
         self.parent.show_confirmation(
             "Update Available",
             message,
             on_confirm,
-            confirm_text="Open GitHub",
+            confirm_text="Download & Install",
             cancel_text="Later"
         )
+
+    def start_download_update(self):
+        """Start downloading the update"""
+        # Show download progress popup
+        self.download_progress_popup = DownloadProgressPopup(self.parent)
+        self.download_progress_popup.show()
+        self.download_progress_popup.set_status("Connecting to GitHub...")
+
+        # Start download
+        self.current_request_type = 'download'
+        request = QNetworkRequest(QUrl(__github_raw_url__))
+        request.setHeader(QNetworkRequest.KnownHeaders.UserAgentHeader, f"NdotClock/{__version__}")
+
+        reply = self.network_manager.get(request)
+        reply.downloadProgress.connect(self._on_download_progress)
+
+    def _on_download_progress(self, bytes_received: int, bytes_total: int):
+        """Update download progress"""
+        if bytes_total > 0 and self.download_progress_popup:
+            progress = int((bytes_received / bytes_total) * 100)
+            self.download_progress_popup.set_progress(progress)
+
+            # Format size
+            mb_received = bytes_received / (1024 * 1024)
+            mb_total = bytes_total / (1024 * 1024)
+            self.download_progress_popup.set_status(f"Downloading... {mb_received:.1f} MB / {mb_total:.1f} MB")
+
+    def _install_update(self, new_file_data: bytes):
+        """Install the downloaded update"""
+        import shutil
+        import subprocess
+
+        if self.download_progress_popup:
+            self.download_progress_popup.set_progress(100)
+            self.download_progress_popup.set_status("Installing update...")
+
+        try:
+            # Get current script path
+            current_file = os.path.abspath(__file__)
+
+            # Create backup
+            backup_file = current_file + '.backup'
+            if self.download_progress_popup:
+                self.download_progress_popup.set_status("Creating backup...")
+
+            shutil.copy2(current_file, backup_file)
+
+            # Write new file
+            if self.download_progress_popup:
+                self.download_progress_popup.set_status("Writing new version...")
+
+            with open(current_file, 'wb') as f:
+                f.write(new_file_data)
+
+            # Close progress popup
+            if self.download_progress_popup:
+                self.download_progress_popup.close()
+
+            # Show restart confirmation
+            def on_restart():
+                # Restart the application
+                python = sys.executable
+                subprocess.Popen([python, current_file])
+                QApplication.quit()
+
+            self.parent.show_confirmation(
+                "Update Installed",
+                f"Update to version {self.latest_version_info['version']} installed successfully!\n\nRestart the application to apply changes.",
+                on_restart,
+                confirm_text="Restart Now",
+                cancel_text="Later"
+            )
+
+        except Exception as e:
+            # Restore backup if installation failed
+            if os.path.exists(backup_file):
+                shutil.copy2(backup_file, current_file)
+
+            if self.download_progress_popup:
+                self.download_progress_popup.close()
+
+            self.parent.show_notification(
+                f"Update installation failed: {str(e)}",
+                duration=5000,
+                notification_type="error"
+            )
 
 
 class NotificationPopup(QWidget):
@@ -258,6 +368,108 @@ class NotificationPopup(QWidget):
         fade_out_anim.setEasingCurve(QEasingCurve.Type.InCubic)
         fade_out_anim.finished.connect(self.close)
         fade_out_anim.start()
+
+
+class DownloadProgressPopup(QWidget):
+    """Download progress window with animation"""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+        # Semi-transparent background overlay
+        self.overlay = QWidget(self)
+        self.overlay.setStyleSheet("background-color: rgba(0, 0, 0, 180);")
+
+        # Main container
+        container = QFrame(self)
+        container.setStyleSheet("""
+            QFrame {
+                background-color: rgba(40, 40, 40, 250);
+                border-radius: 20px;
+                border: 2px solid rgba(255, 255, 255, 40);
+            }
+        """)
+
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(40, 35, 40, 35)
+        layout.setSpacing(25)
+
+        # Title
+        title_label = QLabel("Downloading Update")
+        title_label.setStyleSheet("""
+            QLabel {
+                color: white;
+                font-size: 20px;
+                font-weight: bold;
+                background: transparent;
+            }
+        """)
+        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title_label)
+
+        # Progress bar
+        self.progress_bar = QSlider(Qt.Orientation.Horizontal)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setEnabled(False)
+        self.progress_bar.setStyleSheet("""
+            QSlider {
+                background: transparent;
+            }
+            QSlider::groove:horizontal {
+                border: none;
+                height: 8px;
+                background: rgba(255, 255, 255, 20);
+                border-radius: 4px;
+            }
+            QSlider::sub-page:horizontal {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 rgba(60, 180, 100, 255),
+                    stop:1 rgba(80, 200, 120, 255));
+                border-radius: 4px;
+            }
+            QSlider::handle:horizontal {
+                width: 0px;
+            }
+        """)
+        layout.addWidget(self.progress_bar)
+
+        # Status label
+        self.status_label = QLabel("Preparing download...")
+        self.status_label.setStyleSheet("""
+            QLabel {
+                color: rgba(255, 255, 255, 180);
+                font-size: 14px;
+                background: transparent;
+            }
+        """)
+        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.status_label)
+
+        self.container = container
+        self.container.setFixedWidth(450)
+
+    def showEvent(self, event):
+        """Position popup at center of parent"""
+        super().showEvent(event)
+        if self.parent():
+            parent_rect = self.parent().rect()
+            self.overlay.setGeometry(parent_rect)
+            self.container.adjustSize()
+            x = (parent_rect.width() - self.container.width()) // 2
+            y = (parent_rect.height() - self.container.height()) // 2
+            self.container.move(x, y)
+            self.setGeometry(parent_rect)
+
+    def set_progress(self, value: int):
+        """Update progress bar value (0-100)"""
+        self.progress_bar.setValue(value)
+
+    def set_status(self, text: str):
+        """Update status text"""
+        self.status_label.setText(text)
 
 
 class ConfirmationPopup(QWidget):
