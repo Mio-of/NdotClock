@@ -90,6 +90,13 @@ class UpdateChecker:
                 raw_content = reply.readAll().data().decode('utf-8')
                 latest_version = self._extract_version_from_code(raw_content)
 
+                # Debug: print version comparison
+                print(f"[Update Check] Latest version from GitHub: {latest_version}")
+                print(f"[Update Check] Current version: {__version__}")
+                if latest_version:
+                    comparison = self._compare_versions(latest_version, __version__)
+                    print(f"[Update Check] Comparison result: {comparison} (1=newer, 0=same, -1=older)")
+
                 if latest_version and self._compare_versions(latest_version, __version__) > 0:
                     # Update available
                     self._show_update_dialog(
