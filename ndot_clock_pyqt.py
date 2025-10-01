@@ -23,7 +23,7 @@ from PyQt6.QtWebEngineCore import QWebEngineSettings, QWebEngineProfile, QWebEng
 from urllib.parse import urlencode
 
 # Version info
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __github_repo__ = "Mio-of/NdotClock"
 __github_branch__ = "main"
 __github_api_commits_url__ = f"https://api.github.com/repos/{__github_repo__}/commits/{__github_branch__}"
