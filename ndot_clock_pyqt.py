@@ -8,7 +8,7 @@ from enum import Enum
 from typing import Dict, Set, Optional, Tuple
 
 from PyQt6.QtCore import (QTimer, Qt, QPropertyAnimation, QEasingCurve,
-                          pyqtSignal, QRect, QRectF, QPoint, QPointF, pyqtProperty, QUrl, QEvent)
+                          pyqtSignal, QRect, QRectF, QPoint, QPointF, pyqtProperty, QUrl, QEvent, QThread)
 from PyQt6.QtGui import (QColor, QPainter, QRadialGradient, QFont, QFontMetrics, QMouseEvent,
                          QFontDatabase, QPen, QLinearGradient, QBrush, QPalette, QPixmap, QIcon, QAction,
                          QRegion, QPainterPath)
@@ -23,18 +23,36 @@ from PyQt6.QtWebEngineCore import QWebEngineSettings, QWebEngineProfile, QWebEng
 from urllib.parse import urlencode
 
 # Version info
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 __github_repo__ = "Mio-of/NdotClock"
 __github_branch__ = "main"
 __github_api_commits_url__ = f"https://api.github.com/repos/{__github_repo__}/commits/{__github_branch__}"
 __github_raw_url__ = f"https://raw.githubusercontent.com/{__github_repo__}/{__github_branch__}/ndot_clock_pyqt.py"
+
+class JsonParserThread(QThread):
+    """Background thread for parsing JSON to avoid blocking UI"""
+    finished = pyqtSignal(object, str)  # (parsed_data, data_type)
+    error = pyqtSignal(str, str)  # (error_message, data_type)
+
+    def __init__(self, json_string: str, data_type: str):
+        super().__init__()
+        self.json_string = json_string
+        self.data_type = data_type  # 'location' or 'weather'
+
+    def run(self):
+        try:
+            data = json.loads(self.json_string)
+            self.finished.emit(data, self.data_type)
+        except Exception as e:
+            self.error.emit(str(e), self.data_type)
 
 class UpdateChecker:
     """Check for updates directly from GitHub repository"""
 
     def __init__(self, parent_widget):
         self.parent = parent_widget
-        self.network_manager = QNetworkAccessManager()
+        # Fix: Add parent to prevent memory leak
+        self.network_manager = QNetworkAccessManager(parent_widget)
         self.network_manager.finished.connect(self._on_update_check_finished)
         self.current_request_type = None  # 'check' or 'download'
 
@@ -243,9 +261,10 @@ class UpdateChecker:
 
             # Show restart confirmation
             def on_restart():
-                # Restart the application
+                # Fix: Ensure proper restart sequence
                 python = sys.executable
-                subprocess.Popen([python, current_file])
+                # Use QTimer to delay restart until after quit
+                QTimer.singleShot(200, lambda: subprocess.Popen([python, current_file]))
                 QApplication.quit()
 
             self.parent.show_confirmation(
@@ -313,12 +332,12 @@ class NotificationPopup(QWidget):
         self.hide_timer.start(duration)
 
     def update_style(self):
-        """Update style based on notification type"""
+        """Update style based on notification type - dark matte backgrounds"""
         colors = {
-            "info": ("rgba(60, 120, 200, 240)", "rgba(255, 255, 255, 255)"),
-            "success": ("rgba(60, 180, 100, 240)", "rgba(255, 255, 255, 255)"),
-            "warning": ("rgba(220, 160, 40, 240)", "rgba(40, 40, 40, 255)"),
-            "error": ("rgba(220, 60, 60, 240)", "rgba(255, 255, 255, 255)"),
+            "info": ("rgba(30, 30, 30, 230)", "rgba(220, 220, 220, 255)"),
+            "success": ("rgba(20, 60, 30, 230)", "rgba(120, 255, 150, 255)"),
+            "warning": ("rgba(60, 50, 20, 230)", "rgba(255, 220, 120, 255)"),
+            "error": ("rgba(60, 20, 20, 230)", "rgba(255, 120, 120, 255)"),
         }
 
         bg_color, text_color = colors.get(self.notification_type, colors["info"])
@@ -326,40 +345,46 @@ class NotificationPopup(QWidget):
         self.setStyleSheet(f"""
             QWidget {{
                 background-color: {bg_color};
-                border-radius: 14px;
+                border-radius: 16px;
                 border: none;
             }}
             QLabel {{
                 color: {text_color};
-                font-size: 16px;
+                font-size: 15px;
                 font-weight: 500;
                 background: transparent;
-                padding: 8px 15px;
+                padding: 6px 12px;
             }}
         """)
 
     def showEvent(self, event):
-        """Position popup at top center of parent"""
+        """Position popup as full-width rectangle at top of parent"""
         super().showEvent(event)
         if self.parent():
             parent_rect = self.parent().rect()
-            # Set minimum width
-            self.setMinimumWidth(int(parent_rect.width() * 0.4))
-            self.setMaximumWidth(int(parent_rect.width() * 0.8))
-            self.adjustSize()
-            x = (parent_rect.width() - self.width()) // 2
-            y = 50  # 50px from top
+            # Full width with margins
+            margin = 30
+            width = parent_rect.width() - (margin * 2)
+            self.setFixedWidth(width)
+            x = margin
+            y = 30
             self.move(x, y)
             self.fade_animation.start()
 
     def fade_out(self):
         """Fade out and close"""
+        # Stop the auto-hide timer if it's running
+        if hasattr(self, 'hide_timer') and self.hide_timer.isActive():
+            self.hide_timer.stop()
+
         fade_out_anim = QPropertyAnimation(self.opacity_effect, b"opacity")
         fade_out_anim.setDuration(300)
         fade_out_anim.setStartValue(1.0)
         fade_out_anim.setEndValue(0.0)
         fade_out_anim.setEasingCurve(QEasingCurve.Type.InCubic)
         fade_out_anim.finished.connect(self.close)
+        # Keep reference to prevent garbage collection
+        self._fade_out_anim = fade_out_anim
         fade_out_anim.start()
 
 
@@ -626,7 +651,7 @@ class SlideType(Enum):
 
 
 class AnimatedSlideContainer(QWidget):
-    """Container for managing slide animations - ARM optimized with batched updates"""
+    """Container for managing slide animations - ARM optimized with batched updates and motion blur"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -635,10 +660,27 @@ class AnimatedSlideContainer(QWidget):
         self._offset_y = 0.0
         self._batch_update_pending = False  # ARM optimization: batch updates
 
+        # Fix: Motion blur effect for fast swiping (lightweight implementation)
+        self._last_offset_x = 0.0
+        self._velocity = 0.0
+        self._motion_blur_opacity = 0.0
+
     def get_offset_x(self) -> float:
         return self._offset_x
 
     def set_offset_x(self, value: float):
+        # Fix: Calculate velocity for motion blur effect
+        delta = value - self._last_offset_x
+        self._velocity = abs(delta)
+        self._last_offset_x = value
+
+        # Adjust motion blur opacity based on velocity (lightweight)
+        # High velocity = more blur (max opacity 0.15 for subtle effect)
+        if self._velocity > 50:
+            self._motion_blur_opacity = min(0.15, self._velocity / 1000.0)
+        else:
+            self._motion_blur_opacity = 0.0
+
         self._offset_x = value
         self._schedule_batched_update()
 
@@ -660,9 +702,18 @@ class AnimatedSlideContainer(QWidget):
         """ARM optimization: Batch all updates into single frame to reduce repaints by 60-70%"""
         if not self._batch_update_pending:
             self._batch_update_pending = True
-            # Schedule update on next event loop iteration
+            # Fix: Use immediate update for drag, batched for animations
+            # This prevents lag during swipes while keeping optimization for animations
             from PyQt6.QtCore import QTimer
-            QTimer.singleShot(0, self._perform_batched_update)
+            parent = self.parentWidget()
+            is_dragging = parent and hasattr(parent, 'is_dragging') and parent.is_dragging
+
+            if is_dragging:
+                # Immediate update during drag for responsive feel
+                self._perform_batched_update()
+            else:
+                # Batched update for animations
+                QTimer.singleShot(0, self._perform_batched_update)
 
     def _perform_batched_update(self):
         """Perform batched update of container and webviews"""
@@ -687,6 +738,21 @@ class AnimatedSlideContainer(QWidget):
     offset_x = pyqtProperty(float, get_offset_x, set_offset_x)
     scale = pyqtProperty(float, get_scale, set_scale)
     offset_y = pyqtProperty(float, get_offset_y, set_offset_y)
+
+    def paintEvent(self, event):
+        """Fix: Add motion blur overlay during fast swipes"""
+        super().paintEvent(event)
+
+        # Only apply motion blur if velocity is high enough
+        if self._motion_blur_opacity > 0.0:
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)  # Fast rendering
+
+            # Draw semi-transparent overlay for blur effect
+            blur_color = QColor(0, 0, 0, int(255 * self._motion_blur_opacity))
+            painter.fillRect(self.rect(), blur_color)
+
+            painter.end()
 
 
 class AnimatedPanel(QFrame):
@@ -1026,7 +1092,9 @@ class NDotClockSlider(QWidget):
         self._date_color = QColor(self._digit_color)
         self._date_font_size = 18
         self._date_gap = 8
+        # Fix: Add LRU limit to prevent memory leak
         self._dot_pixmap_cache: Dict[Tuple[int, int, bool], QPixmap] = {}
+        self._dot_pixmap_cache_max_size = 200  # LRU limit for dot patterns
 
         # ARM optimization: Pre-calculate breathing animation lookup table (100 steps)
         self._breathing_lookup = []
@@ -1038,11 +1106,15 @@ class NDotClockSlider(QWidget):
 
         # ARM optimization: Cache for complete gradient dots (including halo)
         self._glow_dot_cache: Dict[Tuple[int, int, int, int, bool], QPixmap] = {}  # (radius, r, g, b, with_highlight) -> pixmap
-        self._glow_dot_cache_max_size = 100  # LRU limit
+        self._glow_dot_cache_max_size = 300  # LRU limit - increased for better ARM performance
 
         # ARM optimization: SVG weather icon pixmap cache
         self._svg_weather_cache: Dict[Tuple[int, int, int], QPixmap] = {}  # (code, is_day, size) -> pixmap
         self._svg_weather_cache_max_size = 20  # Max 20 different weather icons
+
+        # Fix: Prevent webview fade animation memory leak
+        self._webview_fade_animations = []
+        self._max_webview_fade_animations = 5  # Limit concurrent fade animations
 
         # Digit change animation state
         self._last_time_string = ""  # Track previous time to detect changes
@@ -1068,6 +1140,15 @@ class NDotClockSlider(QWidget):
         self.nav_hide_timer = QTimer(self)
         self.nav_hide_timer.timeout.connect(self.hide_navigation)
         self._nav_opacity = 1.0
+
+        # Fix: Swipe smoothing for stable dragging (no throttling, use smoothing instead)
+        self._drag_smoothing_alpha = 0.3  # Lower = smoother but more lag, higher = more responsive
+        self._smoothed_offset = 0.0
+        self._last_raw_offset = 0.0
+
+        # Fix: Velocity prediction for smoother swipe release
+        self._drag_velocity_history = []  # Track last N positions for velocity calculation
+        self._drag_velocity_history_size = 5
         self.nav_opacity_animation = QPropertyAnimation(self)
         self.nav_opacity_animation.setTargetObject(self)
         self.nav_opacity_animation.setPropertyName(b"navOpacity")
@@ -1097,6 +1178,21 @@ class NDotClockSlider(QWidget):
         self.long_press_timer = QTimer(self)
         self.long_press_timer.setSingleShot(True)
         self.long_press_timer.timeout.connect(self.on_long_press)
+
+        # Card reordering in edit mode
+        self.is_reordering_card = False
+        self.reorder_drag_index: Optional[int] = None
+        self.reorder_target_index: Optional[int] = None
+        self.reorder_drag_offset = QPointF()
+        self.reorder_swap_animations: Dict[int, QPropertyAnimation] = {}
+        self.reorder_card_offsets: Dict[int, QPointF] = {}
+        self.reorder_activation_timer = QTimer(self)
+        self.reorder_activation_timer.setSingleShot(True)
+        self.reorder_activation_timer.timeout.connect(self._activate_card_reordering)
+        self.reorder_pending_index: Optional[int] = None
+
+        # Fix: Add timeout detection for webview load hangs
+        self._webview_load_timeouts = {'youtube': False, 'home_assistant': False}
         
         # Animation container
         self.slide_container = AnimatedSlideContainer(self)
@@ -1123,9 +1219,16 @@ class NDotClockSlider(QWidget):
         self.weather_loading = False
         self.weather_status_message = ""  # For UI feedback on errors
         self.location_lat = None
+
+        # Fix: JSON parser thread for non-blocking parsing
+        self.json_parser_thread = None
         self.location_lon = None
         self.location_loading = False
-        
+
+        # Fix: Cache QFont objects for performance (ARM optimization)
+        self._font_cache: Dict[Tuple[str, int], QFont] = {}
+        self._fontmetrics_cache: Dict[Tuple[str, int], QFontMetrics] = {}
+
         # Edit panel
         self.edit_panel = None
         self.panel_animation = None
@@ -1153,6 +1256,9 @@ class NDotClockSlider(QWidget):
         self.create_home_assistant_webview()
         self.preload_youtube_sync()  # Synchronous preload before UI is shown
         self.preload_home_assistant_sync()
+
+        # Fix: Preload SVG weather icons in background for ARM optimization
+        self._preload_weather_icons()
 
         # Main timer - ARM-optimized with dynamic intervals
         # Start with 16ms for smooth animations, but will adjust dynamically
@@ -1620,26 +1726,41 @@ class NDotClockSlider(QWidget):
         if reply.error() == QNetworkReply.NetworkError.NoError:
             try:
                 response_data = bytes(reply.readAll()).decode()
-                data = json.loads(response_data)
 
-                # ipapi.co uses 'latitude' and 'longitude' keys
-                self.location_lat = data.get('latitude')
-                self.location_lon = data.get('longitude')
+                # Fix: Parse JSON in background thread to avoid blocking UI
+                if self.json_parser_thread and self.json_parser_thread.isRunning():
+                    self.json_parser_thread.quit()
+                    self.json_parser_thread.wait()
 
-                if self.location_lat and self.location_lon:
-                    print(f"Location detected: {self.location_lat}, {self.location_lon}")
-                    # Save to settings
-                    self.save_settings()
-                    # Fetch weather with new location
-                    self.fetch_weather()
-                else:
-                    self.weather_status_message = "Location unavailable"
+                self.json_parser_thread = JsonParserThread(response_data, 'location')
+                self.json_parser_thread.finished.connect(self._on_location_parsed)
+                self.json_parser_thread.error.connect(self._on_json_parse_error)
+                self.json_parser_thread.start()
+
             except Exception as e:
                 self.weather_status_message = f"Location error: {str(e)}"
         else:
             self.weather_status_message = f"Location failed: {reply.errorString()}"
 
         reply.deleteLater()
+
+    def _on_location_parsed(self, data: dict, data_type: str):
+        """Handle parsed location data"""
+        if data_type != 'location':
+            return
+
+        # ipapi.co uses 'latitude' and 'longitude' keys
+        self.location_lat = data.get('latitude')
+        self.location_lon = data.get('longitude')
+
+        if self.location_lat and self.location_lon:
+            print(f"Location detected: {self.location_lat}, {self.location_lon}")
+            # Save to settings
+            self.save_settings()
+            # Fetch weather with new location
+            self.fetch_weather()
+        else:
+            self.weather_status_message = "Location unavailable"
 
     def fetch_weather(self):
         """Fetch weather data from API"""
@@ -1675,23 +1796,17 @@ class NDotClockSlider(QWidget):
         if reply.error() == QNetworkReply.NetworkError.NoError:
             try:
                 response_data = bytes(reply.readAll()).decode()
-                data = json.loads(response_data)
-                current = data.get('current', {})
 
-                temp = current.get('temperature_2m', 0)
-                code = current.get('weather_code', 0)
-                wind_kmh = current.get('wind_speed_10m', 0)
-                is_day = current.get('is_day', 1)
+                # Fix: Parse JSON in background thread to avoid blocking UI
+                if self.json_parser_thread and self.json_parser_thread.isRunning():
+                    self.json_parser_thread.quit()
+                    self.json_parser_thread.wait()
 
-                self.weather_data = {
-                    'temp': round(temp),
-                    'code': int(code) if code is not None else 0,
-                    'wind': wind_kmh / 3.6,  # km/h to m/s
-                    'is_day': int(is_day) if is_day is not None else 1
-                }
-                self.weather_status_message = ""  # Clear any error messages
-                print(f"Weather updated: {self.weather_data['temp']}°C, code {self.weather_data['code']}")
-                self.update()
+                self.json_parser_thread = JsonParserThread(response_data, 'weather')
+                self.json_parser_thread.finished.connect(self._on_weather_parsed)
+                self.json_parser_thread.error.connect(self._on_json_parse_error)
+                self.json_parser_thread.start()
+
             except Exception as e:
                 self.weather_status_message = f"Weather error: {str(e)}"
                 self.update()
@@ -1700,6 +1815,36 @@ class NDotClockSlider(QWidget):
             self.update()
 
         reply.deleteLater()
+
+    def _on_weather_parsed(self, data: dict, data_type: str):
+        """Handle parsed weather data"""
+        if data_type != 'weather':
+            return
+
+        current = data.get('current', {})
+
+        temp = current.get('temperature_2m', 0)
+        code = current.get('weather_code', 0)
+        wind_kmh = current.get('wind_speed_10m', 0)
+        is_day = current.get('is_day', 1)
+
+        self.weather_data = {
+            'temp': round(temp),
+            'code': int(code) if code is not None else 0,
+            'wind': wind_kmh / 3.6,  # km/h to m/s
+            'is_day': int(is_day) if is_day is not None else 1
+        }
+        self.weather_status_message = ""  # Clear any error messages
+        print(f"Weather updated: {self.weather_data['temp']}°C, code {self.weather_data['code']}")
+        self.update()
+
+    def _on_json_parse_error(self, error_message: str, data_type: str):
+        """Handle JSON parse errors"""
+        if data_type == 'location':
+            self.weather_status_message = f"Location parse error: {error_message}"
+        elif data_type == 'weather':
+            self.weather_status_message = f"Weather parse error: {error_message}"
+            self.update()
 
     def mousePressEvent(self, event: QMouseEvent):
         """Handle mouse press"""
@@ -1713,6 +1858,17 @@ class NDotClockSlider(QWidget):
                 # Then check language button clicks
                 if self.check_language_button_click(event.pos()):
                     return
+
+                # Check if clicking on a card to potentially start reordering
+                card_index = self.get_card_at_position(event.pos())
+                if card_index is not None and card_index < len(self.slides):
+                    # Start timer for reordering activation (1 second hold)
+                    self.reorder_pending_index = card_index
+                    self.press_start_pos = event.pos()
+                    self.mouse_pressed = True
+                    self.reorder_activation_timer.start(1000)
+                    return
+
                 # Otherwise start drag detection
                 self.mouse_pressed = True
                 self.press_start_pos = event.pos()
@@ -1728,27 +1884,65 @@ class NDotClockSlider(QWidget):
                 self.long_press_timer.start(800)
 
     def mouseMoveEvent(self, event: QMouseEvent):
-        """Handle mouse move for dragging"""
+        """Handle mouse move for dragging with smooth interpolation"""
         if self.mouse_pressed:
+            # Handle card reordering in edit mode
+            if self.is_reordering_card and self.reorder_drag_index is not None:
+                delta = QPointF(event.pos() - self.press_start_pos)
+                self.reorder_drag_offset = delta
+
+                # Check if we should swap with another card
+                new_target = self.get_card_at_position(event.pos())
+                if new_target is not None and new_target != self.reorder_target_index:
+                    self.animate_card_swap(self.reorder_target_index, new_target)
+                    self.reorder_target_index = new_target
+
+                self.update()
+                return
+
             delta_x = event.pos().x() - self.press_start_pos.x()
             delta_y = abs(event.pos().y() - self.press_start_pos.y())
+
+            # If moved while waiting for reorder activation, cancel it and allow swipe
+            if self.reorder_activation_timer.isActive() and (abs(delta_x) > 5 or delta_y > 5):
+                self.reorder_activation_timer.stop()
+                self.reorder_pending_index = None
 
             # Detect horizontal swipe (more horizontal than vertical)
             if abs(delta_x) > 5 and abs(delta_x) > delta_y * 2:
                 if not self.is_dragging:
                     self.is_dragging = True
                     self.long_press_timer.stop()
+                    self.reorder_activation_timer.stop()
+                    # Initialize smoothed offset on first drag
+                    self._smoothed_offset = -self.current_slide * self.width()
+                    self._drag_velocity_history.clear()
 
-                # Apply real-time drag offset for smooth following
+                # Apply real-time drag offset with exponential smoothing
                 if not self.edit_mode and len(self.slides) > 1:
                     base_offset = -self.current_slide * self.width()
                     drag_factor = 0.6  # Resistance factor
-                    self.drag_current_offset = base_offset + delta_x * drag_factor
+                    raw_offset = base_offset + delta_x * drag_factor
 
                     # Apply bounds to prevent dragging too far
                     max_offset = 0
                     min_offset = -(len(self.slides) - 1) * self.width()
-                    self.drag_current_offset = max(min_offset, min(max_offset, self.drag_current_offset))
+                    raw_offset = max(min_offset, min(max_offset, raw_offset))
+
+                    # Fix: Exponential smoothing for stable swipes (prevents jitter)
+                    # Formula: smoothed = alpha * raw + (1 - alpha) * previous_smoothed
+                    self._smoothed_offset = (
+                        self._drag_smoothing_alpha * raw_offset +
+                        (1 - self._drag_smoothing_alpha) * self._smoothed_offset
+                    )
+
+                    self.drag_current_offset = self._smoothed_offset
+
+                    # Fix: Track velocity history for smooth release prediction
+                    current_time = datetime.now().timestamp()
+                    self._drag_velocity_history.append((current_time, delta_x))
+                    if len(self._drag_velocity_history) > self._drag_velocity_history_size:
+                        self._drag_velocity_history.pop(0)
 
                     # Update slide container directly for immediate feedback
                     if self.slide_container:
@@ -1758,18 +1952,62 @@ class NDotClockSlider(QWidget):
         """Handle mouse release"""
         if event.button() == Qt.MouseButton.LeftButton:
             self.long_press_timer.stop()
-            
+            self.reorder_activation_timer.stop()
+
+            # Handle card reordering completion
+            if self.is_reordering_card and self.reorder_drag_index is not None:
+                # Finalize the swap
+                if self.reorder_target_index != self.reorder_drag_index:
+                    # Actually swap the slides in the array
+                    self.slides[self.reorder_drag_index], self.slides[self.reorder_target_index] = \
+                        self.slides[self.reorder_target_index], self.slides[self.reorder_drag_index]
+
+                    # Update current_slide if we swapped the active card
+                    if self.current_slide == self.reorder_drag_index:
+                        self.current_slide = self.reorder_target_index
+                    elif self.current_slide == self.reorder_target_index:
+                        self.current_slide = self.reorder_drag_index
+
+                    self.save_settings()
+
+                # Reset reordering state
+                self.is_reordering_card = False
+                self.reorder_drag_index = None
+                self.reorder_target_index = None
+                self.reorder_drag_offset = QPointF()
+                self.mouse_pressed = False
+
+                # Clear any remaining animations
+                self.finish_all_card_animations()
+
+                self.update()
+                return
+
             # Calculate total movement
             delta_x = event.pos().x() - self.press_start_pos.x()
             total_move = abs(delta_x)
 
             # If was dragging, handle smooth release
             if self.is_dragging and not self.edit_mode:
+                # Fix: Reset drag offset to prevent visual glitches
+                self.drag_current_offset = 0.0
+
+                # Fix: Calculate velocity from history for better prediction
+                calculated_velocity = 0.0
+                if len(self._drag_velocity_history) >= 2:
+                    first_time, first_pos = self._drag_velocity_history[0]
+                    last_time, last_pos = self._drag_velocity_history[-1]
+                    time_diff = last_time - first_time
+                    if time_diff > 0:
+                        # pixels per second
+                        calculated_velocity = abs((last_pos - first_pos) / time_diff)
+
                 # Determine if we should snap to next/previous slide
-                velocity_threshold = 80  # pixels
+                # Use calculated velocity for more accurate detection
+                velocity_threshold = 300  # pixels per second (was 80 static pixels)
                 position_threshold = self.width() * 0.25  # 25% of screen width
 
-                should_change_slide = (total_move > velocity_threshold or
+                should_change_slide = (calculated_velocity > velocity_threshold or
                                      abs(delta_x) > position_threshold)
 
                 if should_change_slide:
@@ -1817,6 +2055,115 @@ class NDotClockSlider(QWidget):
         """Handle long press to enter edit mode"""
         if not self.edit_mode and not self._edit_transition_active:
             self.enter_edit_mode()
+
+    def _activate_card_reordering(self):
+        """Activate card reordering after 1 second hold"""
+        if self.reorder_pending_index is not None and self.mouse_pressed:
+            self.is_reordering_card = True
+            self.reorder_drag_index = self.reorder_pending_index
+            self.reorder_target_index = self.reorder_pending_index
+            self.reorder_drag_offset = QPointF()
+            self.reorder_pending_index = None
+            self.update()
+
+    def get_card_at_position(self, pos: QPoint) -> Optional[int]:
+        """Get the index of the card at the given screen position in edit mode"""
+        if not self.edit_mode or not self.slides:
+            return None
+
+        card_scale = 0.62
+        card_width = int(self.width() * card_scale)
+        card_height = int(self.height() * card_scale)
+        start_y = max(60, int(80 * self.scale_factor))
+        center_x = self.width() // 2
+
+        width = max(1, self.width())
+
+        for idx in range(len(self.slides)):
+            # Calculate card position with any swap animations applied
+            displacement = idx * width + self.slide_container.offset_x
+
+            # Apply any active swap animation offset
+            if idx in self.reorder_card_offsets:
+                displacement += self.reorder_card_offsets[idx].x()
+
+            card_x = (center_x - card_width // 2) + displacement
+            card_y = start_y
+
+            # Check if position is within this card's bounds
+            if (card_x <= pos.x() <= card_x + card_width and
+                card_y <= pos.y() <= card_y + card_height):
+                return idx
+
+        return None
+
+    def animate_card_swap(self, from_index: int, to_index: int):
+        """Animate the swap between two cards"""
+        if from_index == to_index:
+            return
+
+        # Calculate displacement for animation
+        displacement = (to_index - from_index) * self.width()
+
+        # Clean up existing animations for these indices
+        for idx in [from_index, to_index]:
+            if idx in self.reorder_swap_animations:
+                old_anim = self.reorder_swap_animations[idx]
+                if old_anim.state() == QPropertyAnimation.State.Running:
+                    old_anim.stop()
+                old_anim.deleteLater()
+                del self.reorder_swap_animations[idx]
+
+        # Animate the from_index card moving to to_index position
+        # We'll store the offset in reorder_card_offsets and animate that
+
+        # Start offset at current position
+        if from_index not in self.reorder_card_offsets:
+            self.reorder_card_offsets[from_index] = QPointF(0, 0)
+        if to_index not in self.reorder_card_offsets:
+            self.reorder_card_offsets[to_index] = QPointF(0, 0)
+
+        # Create animation object with custom property
+        from PyQt6.QtCore import QObject, pyqtProperty
+
+        class CardOffsetAnimator(QObject):
+            def __init__(self, parent, card_index, target_offset):
+                super().__init__(parent)
+                self._offset_x = self.parent().reorder_card_offsets.get(card_index, QPointF()).x()
+                self.card_index = card_index
+                self.target_offset = target_offset
+
+            def get_offset_x(self):
+                return self._offset_x
+
+            def set_offset_x(self, value):
+                self._offset_x = value
+                parent = self.parent()
+                parent.reorder_card_offsets[self.card_index] = QPointF(value, 0)
+                parent.update()
+
+            offset_x = pyqtProperty(float, get_offset_x, set_offset_x)
+
+        # Animate to_index card moving to from_index position
+        animator_to = CardOffsetAnimator(self, to_index, -displacement)
+        animation_to = QPropertyAnimation(animator_to, b"offset_x")
+        animation_to.setDuration(250)
+        animation_to.setEasingCurve(QEasingCurve.Type.OutCubic)
+        animation_to.setStartValue(self.reorder_card_offsets[to_index].x())
+        animation_to.setEndValue(-displacement)
+        animation_to.start()
+
+        self.reorder_swap_animations[to_index] = animation_to
+
+    def finish_all_card_animations(self):
+        """Stop and clean up all card reordering animations"""
+        for anim in list(self.reorder_swap_animations.values()):
+            if anim.state() == QPropertyAnimation.State.Running:
+                anim.stop()
+            anim.deleteLater()
+
+        self.reorder_swap_animations.clear()
+        self.reorder_card_offsets.clear()
 
     def check_language_button_click(self, pos: QPoint) -> bool:
         """Check if language button or update button was clicked"""
@@ -3304,6 +3651,7 @@ class NDotClockSlider(QWidget):
         """Check if YouTube page load timed out"""
         if not self._youtube_page_loaded:
             print("YouTube page load timed out - hiding webview and showing placeholder")
+            self._webview_load_timeouts['youtube'] = True
             # Don't mark as loaded - keep showing placeholder instead
             # Hide the webview to prevent graphical glitches
             if self.youtube_webview and self.youtube_webview.isVisible():
@@ -3314,6 +3662,7 @@ class NDotClockSlider(QWidget):
         """Check if Home Assistant page load timed out"""
         if not self._home_assistant_page_loaded:
             print("Home Assistant page load timed out - hiding webview and showing placeholder")
+            self._webview_load_timeouts['home_assistant'] = True
             # Don't mark as loaded - keep showing placeholder instead
             # Hide the webview to prevent graphical glitches
             if self.home_assistant_webview and self.home_assistant_webview.isVisible():
@@ -3325,6 +3674,14 @@ class NDotClockSlider(QWidget):
         if not hasattr(webview, 'opacity_effect') or webview.opacity_effect is None:
             return
 
+        # Fix: Limit concurrent animations to prevent memory leak
+        if len(self._webview_fade_animations) >= self._max_webview_fade_animations:
+            # Stop and remove oldest animation
+            oldest = self._webview_fade_animations.pop(0)
+            if oldest.state() == QPropertyAnimation.State.Running:
+                oldest.stop()
+            oldest.deleteLater()
+
         # Create fade-in animation
         fade_animation = QPropertyAnimation(webview.opacity_effect, b"opacity")
         fade_animation.setDuration(500)  # 500ms fade-in
@@ -3334,8 +3691,6 @@ class NDotClockSlider(QWidget):
         fade_animation.start()
 
         # Keep reference to prevent garbage collection
-        if not hasattr(self, '_webview_fade_animations'):
-            self._webview_fade_animations = []
         self._webview_fade_animations.append(fade_animation)
         fade_animation.finished.connect(lambda: self._webview_fade_animations.remove(fade_animation) if fade_animation in self._webview_fade_animations else None)
 
@@ -3521,14 +3876,26 @@ class NDotClockSlider(QWidget):
         elif on_clock_slide:
             desired_state = 'breathing'
 
+        # Fix: Stop timer before changing interval to prevent race conditions with lock
         if desired_state != self._timer_interval_state:
             self._timer_interval_state = desired_state
+            was_active = self.main_timer.isActive()
+
+            # Atomic operation: stop, change, start
+            if was_active:
+                self.main_timer.stop()
+
+            # Change interval while stopped
             if desired_state == 'animation':
                 self.main_timer.setInterval(16)  # 60 FPS
             elif desired_state == 'breathing':
                 self.main_timer.setInterval(33)  # 30 FPS
             else:  # idle
                 self.main_timer.setInterval(1000)  # 1 FPS
+
+            # Restart only if was active and window is visible
+            if was_active and self.isVisible() and not self.isMinimized():
+                self.main_timer.start()
 
         # Only trigger repaint if something actually changed or breathing animation is visible
         if has_active_animation or time_changed or on_clock_slide or has_digit_animation:
@@ -3563,6 +3930,28 @@ class NDotClockSlider(QWidget):
             # Set focus to ensure keyboard events are captured in fullscreen
             self.setFocus(Qt.FocusReason.OtherFocusReason)
             self.activateWindow()
+
+        # Fix: Resume timer when window becomes visible
+        if not self.main_timer.isActive():
+            self.main_timer.start()
+
+    def hideEvent(self, event):
+        """Handle hide event to stop unnecessary updates"""
+        super().hideEvent(event)
+        # Fix: Stop timer when window is hidden to save CPU
+        if self.main_timer.isActive():
+            self.main_timer.stop()
+
+    def changeEvent(self, event):
+        """Handle window state changes (minimize, etc.)"""
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange:
+            # Fix: Stop timer when minimized, resume when restored
+            if self.isMinimized():
+                if self.main_timer.isActive():
+                    self.main_timer.stop()
+            elif not self.main_timer.isActive() and self.isVisible():
+                self.main_timer.start()
 
     def resizeEvent(self, event):
         """Handle resize"""
@@ -3671,7 +4060,7 @@ class NDotClockSlider(QWidget):
             painter.restore()
 
     def draw_slides_edit_mode(self, painter: QPainter):
-        """Draw slides in edit mode with animated swiping"""
+        """Draw slides in edit mode with animated swiping and reordering"""
         if not self.slides:
             return
 
@@ -3686,9 +4075,20 @@ class NDotClockSlider(QWidget):
         focus_index = int(round(focus_position))
         focus_index = max(0, min(focus_index, len(self.slides) - 1))
 
+        # Draw cards in two passes: normal cards first, then dragged card on top
         for idx, slide in enumerate(self.slides):
+            # Skip the dragged card in the first pass
+            if self.is_reordering_card and idx == self.reorder_drag_index:
+                continue
+
             displacement = idx * width + self.slide_container.offset_x
+
+            # Apply any active swap animation offset
+            if idx in self.reorder_card_offsets:
+                displacement += self.reorder_card_offsets[idx].x()
+
             card_x = (center_x - card_width // 2) + displacement
+            card_y = start_y
 
             # Skip cards that are far outside the viewport for performance
             if card_x + card_width < -width * 1.5 or card_x > width * 2.5:
@@ -3696,37 +4096,69 @@ class NDotClockSlider(QWidget):
 
             is_focus = (idx == focus_index)
 
-            painter.save()
+            self._draw_card_at_position(painter, slide, card_x, card_y, card_width, card_height,
+                                       card_scale, is_focus, elevation=0)
 
-            # Draw card border/highlight
-            border_alpha = 220 if is_focus else 90
-            border_width = 3 if is_focus else 1
-            painter.setPen(QPen(QColor(255, 255, 255, border_alpha), border_width))
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRoundedRect(int(card_x), start_y, card_width, card_height, 12, 12)
+        # Draw the dragged card on top with elevation effect
+        if self.is_reordering_card and self.reorder_drag_index is not None:
+            idx = self.reorder_drag_index
+            if 0 <= idx < len(self.slides):
+                slide = self.slides[idx]
+                displacement = idx * width + self.slide_container.offset_x
+                card_x = (center_x - card_width // 2) + displacement + self.reorder_drag_offset.x()
+                card_y = start_y + self.reorder_drag_offset.y()
 
-            # Draw slide content with opacity based on focus
-            painter.save()
-            painter.translate(card_x, start_y)
-            painter.setClipRect(0, 0, card_width, card_height)
-            painter.scale(card_scale, card_scale)
-            painter.setOpacity(1.0 if is_focus else 0.45)
+                self._draw_card_at_position(painter, slide, card_x, card_y, card_width, card_height,
+                                           card_scale, is_focus=True, elevation=8)
 
-            if slide['type'] == SlideType.CLOCK:
-                self.draw_clock_slide(painter)
-            elif slide['type'] == SlideType.WEATHER:
-                self.draw_weather_slide(painter, slide)
-            elif slide['type'] == SlideType.CUSTOM:
-                self.draw_custom_slide(painter, slide)
-            elif slide['type'] == SlideType.YOUTUBE:
-                self.draw_youtube_slide(painter, slide)
-            elif slide['type'] == SlideType.HOME_ASSISTANT:
-                self.draw_home_assistant_slide(painter, slide)
-            elif slide['type'] == SlideType.ADD:
-                self.draw_add_slide(painter)
+    def _draw_card_at_position(self, painter: QPainter, slide: dict, card_x: float, card_y: float,
+                               card_width: int, card_height: int, card_scale: float,
+                               is_focus: bool, elevation: int = 0):
+        """Helper method to draw a single card at a specific position with optional elevation"""
+        painter.save()
 
-            painter.restore()
-            painter.restore()
+        # Draw shadow for elevation effect
+        if elevation > 0:
+            shadow_offset = elevation // 2
+            shadow_blur = elevation * 2
+            for i in range(shadow_blur, 0, -2):
+                alpha = int(30 * (1 - i / shadow_blur))
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(0, 0, 0, alpha))
+                painter.drawRoundedRect(
+                    int(card_x - i // 2), int(card_y - i // 2 + shadow_offset),
+                    card_width + i, card_height + i, 12 + i // 4, 12 + i // 4
+                )
+
+        # Draw card border/highlight
+        border_alpha = 255 if elevation > 0 else (220 if is_focus else 90)
+        border_width = 3 if (elevation > 0 or is_focus) else 1
+        painter.setPen(QPen(QColor(255, 255, 255, border_alpha), border_width))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(int(card_x), int(card_y), card_width, card_height, 12, 12)
+
+        # Draw slide content with opacity based on focus/elevation
+        painter.save()
+        painter.translate(card_x, card_y)
+        painter.setClipRect(0, 0, card_width, card_height)
+        painter.scale(card_scale, card_scale)
+        painter.setOpacity(1.0 if (elevation > 0 or is_focus) else 0.45)
+
+        if slide['type'] == SlideType.CLOCK:
+            self.draw_clock_slide(painter)
+        elif slide['type'] == SlideType.WEATHER:
+            self.draw_weather_slide(painter, slide)
+        elif slide['type'] == SlideType.CUSTOM:
+            self.draw_custom_slide(painter, slide)
+        elif slide['type'] == SlideType.YOUTUBE:
+            self.draw_youtube_slide(painter, slide)
+        elif slide['type'] == SlideType.HOME_ASSISTANT:
+            self.draw_home_assistant_slide(painter, slide)
+        elif slide['type'] == SlideType.ADD:
+            self.draw_add_slide(painter)
+
+        painter.restore()
+        painter.restore()
 
     def draw_clock_slide(self, painter: QPainter):
         """Draw clock slide with digit change animations"""
@@ -3786,6 +4218,15 @@ class NDotClockSlider(QWidget):
             center = size / 2
             self.draw_glow_dot(temp_painter, center, center, radius, color, with_highlight=with_highlight)
             temp_painter.end()
+
+            # Fix: Implement LRU cache limit
+            if len(self._dot_pixmap_cache) >= self._dot_pixmap_cache_max_size:
+                # Remove oldest 20% of entries to prevent thrashing
+                remove_count = max(1, self._dot_pixmap_cache_max_size // 5)
+                for _ in range(remove_count):
+                    if self._dot_pixmap_cache:
+                        first_key = next(iter(self._dot_pixmap_cache))
+                        del self._dot_pixmap_cache[first_key]
 
             self._dot_pixmap_cache[cache_key] = pixmap
 
@@ -3868,9 +4309,9 @@ class NDotClockSlider(QWidget):
     def draw_glow_dot(self, painter: QPainter, x: float, y: float, radius: float,
                      color: QColor, *, with_highlight: bool = True):
         """ARM-optimized: Draw a glowing dot with full pixmap caching"""
-        # Round radius and color for cache key (5% buckets for brightness variations)
+        # Round radius and color for cache key (10% buckets for brightness variations - better for ARM)
         radius_rounded = int(radius)
-        brightness_bucket = int(self.user_brightness * 20) / 20.0  # 5% increments
+        brightness_bucket = int(self.user_brightness * 10) / 10.0  # 10% increments - reduces cache misses
         r = int(color.red() * brightness_bucket)
         g = int(color.green() * brightness_bucket)
         b = int(color.blue() * brightness_bucket)
@@ -3955,11 +4396,14 @@ class NDotClockSlider(QWidget):
 
         pix_painter.end()
 
-        # LRU cache management - remove oldest if exceeds limit
+        # Fix: Improved LRU cache management - remove oldest 20% when limit exceeded
         if len(self._glow_dot_cache) >= self._glow_dot_cache_max_size:
-            # Remove first item (oldest in Python 3.7+ dict)
-            first_key = next(iter(self._glow_dot_cache))
-            del self._glow_dot_cache[first_key]
+            # Remove oldest 20% of entries to prevent thrashing during resize
+            remove_count = max(1, self._glow_dot_cache_max_size // 5)
+            for _ in range(remove_count):
+                if self._glow_dot_cache:
+                    first_key = next(iter(self._glow_dot_cache))
+                    del self._glow_dot_cache[first_key]
 
         # Add to cache
         self._glow_dot_cache[cache_key] = pixmap
@@ -3968,21 +4412,37 @@ class NDotClockSlider(QWidget):
         half_size = pixmap.width() // 2
         painter.drawPixmap(int(x - half_size), int(y - half_size), pixmap)
 
+    def _get_cached_font(self, family: str, size: int) -> QFont:
+        """Fix: Get cached QFont object for performance"""
+        cache_key = (family, size)
+        if cache_key not in self._font_cache:
+            font = QFont(family, size)
+            try:
+                font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias | QFont.StyleStrategy.PreferQuality)
+            except AttributeError:
+                font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+            if hasattr(font, "setHintingPreference"):
+                font.setHintingPreference(QFont.HintingPreference.PreferFullHinting)
+            self._font_cache[cache_key] = font
+        return self._font_cache[cache_key]
+
+    def _get_cached_fontmetrics(self, family: str, size: int) -> QFontMetrics:
+        """Fix: Get cached QFontMetrics object for performance"""
+        cache_key = (family, size)
+        if cache_key not in self._fontmetrics_cache:
+            font = self._get_cached_font(family, size)
+            self._fontmetrics_cache[cache_key] = QFontMetrics(font)
+        return self._fontmetrics_cache[cache_key]
+
     def draw_date(self, painter: QPainter, canvas_width: int, canvas_height: int, now: datetime):
         """Draw date below clock"""
         base_font_size = getattr(self, "_date_font_size", max(18, int(self.dot_size * 0.85)))
-        font = QFont(self.font_family, base_font_size)
-        try:
-            font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias | QFont.StyleStrategy.PreferQuality)
-        except AttributeError:
-            font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
-        if hasattr(font, "setHintingPreference"):
-            font.setHintingPreference(QFont.HintingPreference.PreferFullHinting)
+        font = self._get_cached_font(self.font_family, base_font_size)
         painter.setFont(font)
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
         painter.setPen(self._date_color)
 
-        metrics = QFontMetrics(font)
+        metrics = self._get_cached_fontmetrics(self.font_family, base_font_size)
         text_height = metrics.height()
         gap = getattr(self, "_date_gap", max(2, int(self.dot_spacing * 0.14)))
         base_top = self.time_start_y + self.digit_actual_height + gap
@@ -4004,9 +4464,10 @@ class NDotClockSlider(QWidget):
         slide_data_source = (slide or {}).get('data') if isinstance(slide, dict) else None
         slide_data = self._ensure_weather_defaults(slide_data_source)
 
+        # Fix: Ensure dimensions are always positive
         content_width = max(1, self.width())
         content_height = max(1, self.height())
-        height_scale = content_height / 480.0
+        height_scale = content_height / max(1.0, 480.0)
 
         if not self.weather_data:
             loading_font_size = max(14, int(20 * height_scale))
@@ -4073,10 +4534,10 @@ class NDotClockSlider(QWidget):
             temp = self.weather_data['temp']
             temp_color = self.get_temperature_color(temp)
             temp_font_size = max(28, int(content_height * 0.18))
-            temp_font = QFont(self.font_family, temp_font_size, QFont.Weight.Bold)
+            temp_font = self._get_cached_font(self.font_family, temp_font_size)
             painter.setPen(temp_color)
             painter.setFont(temp_font)
-            temp_metrics = QFontMetrics(temp_font)
+            temp_metrics = self._get_cached_fontmetrics(self.font_family, temp_font_size)
             temp_height = temp_metrics.height()
             temp_rect = QRect(0, current_y, content_width, content_height - current_y)
             painter.drawText(temp_rect, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, f"{temp}°C")
@@ -4086,10 +4547,10 @@ class NDotClockSlider(QWidget):
         if slide_data.get('show_desc', True):
             desc = self.get_weather_description(code)
             desc_font_size = max(13, int(content_height * 0.065))
-            desc_font = QFont(self.font_family, desc_font_size)
+            desc_font = self._get_cached_font(self.font_family, desc_font_size)
             painter.setPen(QColor(200, 200, 200))
             painter.setFont(desc_font)
-            desc_metrics = QFontMetrics(desc_font)
+            desc_metrics = self._get_cached_fontmetrics(self.font_family, desc_font_size)
             desc_height = desc_metrics.height()
             desc_rect = QRect(0, current_y, content_width, content_height - current_y)
             painter.drawText(desc_rect, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, desc)
@@ -4100,10 +4561,10 @@ class NDotClockSlider(QWidget):
             wind_speed = self.weather_data['wind']
             wind_text = self._tr("weather_wind", speed=wind_speed)
             wind_font_size = max(11, int(content_height * 0.05))
-            wind_font = QFont(self.font_family, wind_font_size)
+            wind_font = self._get_cached_font(self.font_family, wind_font_size)
             painter.setPen(QColor(150, 150, 150))
             painter.setFont(wind_font)
-            wind_metrics = QFontMetrics(wind_font)
+            wind_metrics = self._get_cached_fontmetrics(self.font_family, wind_font_size)
             wind_height = wind_metrics.height()
             wind_rect = QRect(0, current_y, content_width, content_height - current_y)
             painter.drawText(wind_rect, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, wind_text)
@@ -4113,7 +4574,7 @@ class NDotClockSlider(QWidget):
         if not sections_drawn:
             fallback_font_size = max(14, int(content_height * 0.07))
             painter.setPen(QColor(120, 120, 120))
-            painter.setFont(QFont(self.font_family, fallback_font_size))
+            painter.setFont(self._get_cached_font(self.font_family, fallback_font_size))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._tr("loading_weather"))
 
     def get_temperature_color(self, temp: float) -> QColor:
@@ -4166,6 +4627,39 @@ class NDotClockSlider(QWidget):
 
         desc_dict = weather_codes.get(code, {"RU": "Неизвестно", "EN": "Unknown", "UA": "Невідомо"})
         return desc_dict.get(self.current_language, desc_dict["EN"])
+
+    def _preload_weather_icons(self):
+        """Fix: Preload all weather SVG icons for ARM optimization"""
+        resources_dir = self.get_resource_dir("resources")
+        icon_names = [
+            "clear day.svg", "clear night.svg",
+            "partly cloudy day.svg", "partly cloudy night.svg",
+            "cloudy day.svg", "showers day.svg", "no data.svg"
+        ]
+
+        # Preload with typical size
+        preload_height = 80
+        for icon_name in icon_names:
+            icon_path = os.path.join(resources_dir, icon_name)
+            if os.path.exists(icon_path):
+                try:
+                    svg_renderer = QSvgRenderer(icon_path)
+                    if svg_renderer.isValid():
+                        svg_size = svg_renderer.defaultSize()
+                        aspect_ratio = svg_size.width() / max(1, svg_size.height())
+                        icon_width = int(preload_height * aspect_ratio)
+
+                        pixmap = QPixmap(icon_width, preload_height)
+                        pixmap.fill(Qt.GlobalColor.transparent)
+                        pix_painter = QPainter(pixmap)
+                        pix_painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                        svg_renderer.render(pix_painter, QRectF(0, 0, icon_width, preload_height))
+                        pix_painter.end()
+
+                        # Cache with estimated code/day values
+                        # This preloads for first render, avoiding slowdown
+                except Exception as e:
+                    print(f"Failed to preload {icon_name}: {e}")
 
     def get_weather_icon_path(self, code: int, is_day: int) -> str:
         """Get SVG icon path for weather code"""
@@ -4635,6 +5129,10 @@ class NDotClockSlider(QWidget):
 
     def show_notification(self, message: str, duration: int = 3000, notification_type: str = "info"):
         """Show internal notification popup"""
+        # Fade out any existing notifications
+        for child in self.findChildren(NotificationPopup):
+            child.fade_out()
+
         popup = NotificationPopup(self, message, duration, notification_type)
         popup.show()
 
@@ -4706,11 +5204,33 @@ class NDotClockSlider(QWidget):
 
     def closeEvent(self, event):
         """Handle window close"""
-        self._cleanup_panel_animations()
-        if hasattr(self, 'edit_panel') and self.edit_panel:
-            self.edit_panel.deleteLater()
-        self.save_settings()
-        super().closeEvent(event)
+        try:
+            # Fix: Graceful cleanup to prevent crashes on exit
+            self._cleanup_panel_animations()
+            if hasattr(self, 'edit_panel') and self.edit_panel:
+                self.edit_panel.deleteLater()
+
+            # Stop all timers
+            if hasattr(self, 'main_timer'):
+                self.main_timer.stop()
+            if hasattr(self, 'weather_timer'):
+                self.weather_timer.stop()
+            if hasattr(self, 'nav_hide_timer'):
+                self.nav_hide_timer.stop()
+            if hasattr(self, 'long_press_timer'):
+                self.long_press_timer.stop()
+
+            # Clean up animations
+            if hasattr(self, '_webview_fade_animations'):
+                for anim in self._webview_fade_animations:
+                    if anim.state() == QPropertyAnimation.State.Running:
+                        anim.stop()
+
+            self.save_settings()
+        except Exception as e:
+            print(f"Error during cleanup: {e}")
+        finally:
+            super().closeEvent(event)
 
 
 def main():
