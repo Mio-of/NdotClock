@@ -112,6 +112,11 @@ class UpdateChecker:
                         notification_type="success"
                     )
 
+            elif self.current_request_type == 'download':
+                # Download completed - install the update
+                downloaded_data = reply.readAll().data()
+                self._install_update(downloaded_data)
+
         except Exception as e:
             if not self.silent:
                 self.parent.show_notification(
@@ -158,19 +163,112 @@ class UpdateChecker:
             return 0
 
     def _show_update_dialog(self, version: str, commit_url: str, commit_message: str, commit_date: str):
-        """Show update available dialog"""
+        """Show update available dialog with auto-update option"""
         message = f"New version {version} available!\nCurrent: {__version__}\n\n{commit_message}"
 
+        # Store version info for download
+        self.latest_version_info = {
+            'version': version,
+            'url': commit_url,
+            'message': commit_message
+        }
+
         def on_confirm():
-            webbrowser.open(f"https://github.com/{__github_repo__}")
+            self.start_download_update()
 
         self.parent.show_confirmation(
             "Update Available",
             message,
             on_confirm,
-            confirm_text="Open GitHub",
+            confirm_text="Download & Install",
             cancel_text="Later"
         )
+
+    def start_download_update(self):
+        """Start downloading the update"""
+        # Show download progress popup
+        self.download_progress_popup = DownloadProgressPopup(self.parent)
+        self.download_progress_popup.show()
+        self.download_progress_popup.set_status("Connecting to GitHub...")
+
+        # Start download
+        self.current_request_type = 'download'
+        request = QNetworkRequest(QUrl(__github_raw_url__))
+        request.setHeader(QNetworkRequest.KnownHeaders.UserAgentHeader, f"NdotClock/{__version__}")
+
+        reply = self.network_manager.get(request)
+        reply.downloadProgress.connect(self._on_download_progress)
+
+    def _on_download_progress(self, bytes_received: int, bytes_total: int):
+        """Update download progress"""
+        if bytes_total > 0 and self.download_progress_popup:
+            progress = int((bytes_received / bytes_total) * 100)
+            self.download_progress_popup.set_progress(progress)
+
+            # Format size
+            mb_received = bytes_received / (1024 * 1024)
+            mb_total = bytes_total / (1024 * 1024)
+            self.download_progress_popup.set_status(f"Downloading... {mb_received:.1f} MB / {mb_total:.1f} MB")
+
+    def _install_update(self, new_file_data: bytes):
+        """Install the downloaded update"""
+        import shutil
+        import subprocess
+
+        if self.download_progress_popup:
+            self.download_progress_popup.set_progress(100)
+            self.download_progress_popup.set_status("Installing update...")
+
+        try:
+            # Get current script path
+            current_file = os.path.abspath(__file__)
+
+            # Create backup
+            backup_file = current_file + '.backup'
+            if self.download_progress_popup:
+                self.download_progress_popup.set_status("Creating backup...")
+
+            shutil.copy2(current_file, backup_file)
+
+            # Write new file
+            if self.download_progress_popup:
+                self.download_progress_popup.set_status("Writing new version...")
+
+            with open(current_file, 'wb') as f:
+                f.write(new_file_data)
+
+            # Close progress popup
+            if self.download_progress_popup:
+                self.download_progress_popup.close()
+
+            # Show restart confirmation
+            def on_restart():
+                # Restart the application
+                python = sys.executable
+                subprocess.Popen([python, current_file])
+                QApplication.quit()
+
+            self.parent.show_confirmation(
+                "Update Installed",
+                f"Update to version {self.latest_version_info['version']} installed successfully!\n\nRestart the application to apply changes.",
+                on_restart,
+                confirm_text="Restart Now",
+                cancel_text="Later"
+            )
+
+        except Exception as e:
+            # Restore backup if installation failed
+            if os.path.exists(backup_file):
+                shutil.copy2(backup_file, current_file)
+
+            if self.download_progress_popup:
+                self.download_progress_popup.close()
+
+            self.parent.show_notification(
+                f"Update installation failed: {str(e)}",
+                duration=5000,
+                notification_type="error"
+            )
 
 
 class NotificationPopup(QWidget):
@@ -178,16 +276,18 @@ class NotificationPopup(QWidget):
 
     def __init__(self, parent, message: str, duration: int = 3000, notification_type: str = "info"):
         super().__init__(parent)
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool)
+        # Don't use Tool flag - keep it as a child widget
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        # Raise to top of parent's children
+        self.raise_()
 
         self.message = message
         self.notification_type = notification_type  # "info", "success", "warning", "error"
 
         # Setup UI
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 15, 20, 15)
+        layout.setContentsMargins(30, 20, 30, 20)
 
         self.label = QLabel(message)
         self.label.setWordWrap(True)
@@ -215,10 +315,10 @@ class NotificationPopup(QWidget):
     def update_style(self):
         """Update style based on notification type"""
         colors = {
-            "info": ("rgba(60, 120, 200, 220)", "rgba(255, 255, 255, 255)"),
-            "success": ("rgba(60, 180, 100, 220)", "rgba(255, 255, 255, 255)"),
-            "warning": ("rgba(220, 160, 40, 220)", "rgba(40, 40, 40, 255)"),
-            "error": ("rgba(220, 60, 60, 220)", "rgba(255, 255, 255, 255)"),
+            "info": ("rgba(60, 120, 200, 240)", "rgba(255, 255, 255, 255)"),
+            "success": ("rgba(60, 180, 100, 240)", "rgba(255, 255, 255, 255)"),
+            "warning": ("rgba(220, 160, 40, 240)", "rgba(40, 40, 40, 255)"),
+            "error": ("rgba(220, 60, 60, 240)", "rgba(255, 255, 255, 255)"),
         }
 
         bg_color, text_color = colors.get(self.notification_type, colors["info"])
@@ -226,15 +326,15 @@ class NotificationPopup(QWidget):
         self.setStyleSheet(f"""
             QWidget {{
                 background-color: {bg_color};
-                border-radius: 12px;
-                border: 1px solid rgba(255, 255, 255, 30);
+                border-radius: 14px;
+                border: none;
             }}
             QLabel {{
                 color: {text_color};
-                font-size: 14px;
+                font-size: 16px;
                 font-weight: 500;
                 background: transparent;
-                padding: 5px;
+                padding: 8px 15px;
             }}
         """)
 
@@ -243,9 +343,12 @@ class NotificationPopup(QWidget):
         super().showEvent(event)
         if self.parent():
             parent_rect = self.parent().rect()
+            # Set minimum width
+            self.setMinimumWidth(int(parent_rect.width() * 0.4))
+            self.setMaximumWidth(int(parent_rect.width() * 0.8))
             self.adjustSize()
             x = (parent_rect.width() - self.width()) // 2
-            y = 40  # 40px from top
+            y = 50  # 50px from top
             self.move(x, y)
             self.fade_animation.start()
 
@@ -281,7 +384,7 @@ class DownloadProgressPopup(QWidget):
             QFrame {
                 background-color: rgba(40, 40, 40, 250);
                 border-radius: 20px;
-                border: 2px solid rgba(255, 255, 255, 40);
+                border: none;
             }
         """)
 
@@ -388,7 +491,7 @@ class ConfirmationPopup(QWidget):
             QFrame {
                 background-color: rgba(40, 40, 40, 240);
                 border-radius: 16px;
-                border: 1px solid rgba(255, 255, 255, 30);
+                border: none;
             }
         """)
 
