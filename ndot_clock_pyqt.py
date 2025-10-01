@@ -56,10 +56,10 @@ class UpdateChecker:
         """Handle update check response"""
         if reply.error() != QNetworkReply.NetworkError.NoError:
             if not self.silent and self.current_request_type == 'check':
-                QMessageBox.warning(
-                    self.parent,
-                    "Update Check Failed",
-                    f"Failed to check for updates:\n{reply.errorString()}"
+                self.parent.show_notification(
+                    f"Failed to check for updates: {reply.errorString()}",
+                    duration=4000,
+                    notification_type="error"
                 )
             reply.deleteLater()
             return
@@ -99,18 +99,18 @@ class UpdateChecker:
                         self.latest_commit_info['date']
                     )
                 elif not self.silent:
-                    QMessageBox.information(
-                        self.parent,
-                        "No Updates",
-                        f"You are running the latest version ({__version__})."
+                    self.parent.show_notification(
+                        f"You are running the latest version ({__version__})",
+                        duration=3000,
+                        notification_type="success"
                     )
 
         except Exception as e:
             if not self.silent:
-                QMessageBox.warning(
-                    self.parent,
-                    "Update Check Error",
-                    f"Error parsing update information:\n{str(e)}"
+                self.parent.show_notification(
+                    f"Error checking updates: {str(e)}",
+                    duration=4000,
+                    notification_type="error"
                 )
         finally:
             reply.deleteLater()
@@ -152,24 +152,250 @@ class UpdateChecker:
 
     def _show_update_dialog(self, version: str, commit_url: str, commit_message: str, commit_date: str):
         """Show update available dialog"""
-        msg = QMessageBox(self.parent)
-        msg.setWindowTitle("Update Available")
-        msg.setIcon(QMessageBox.Icon.Information)
-        msg.setText(f"<b>New version available: {version}</b><br>Current version: {__version__}")
-        msg.setInformativeText("Would you like to download the update from GitHub?")
+        message = f"New version {version} available!\nCurrent: {__version__}\n\n{commit_message}"
 
-        # Format commit info
-        details = f"Latest commit:\n{commit_message}\n\nDate: {commit_date}"
-        msg.setDetailedText(details)
-
-        download_btn = msg.addButton("Open GitHub", QMessageBox.ButtonRole.AcceptRole)
-        msg.addButton("Later", QMessageBox.ButtonRole.RejectRole)
-
-        msg.exec()
-
-        if msg.clickedButton() == download_btn:
-            # Open repository main page
+        def on_confirm():
             webbrowser.open(f"https://github.com/{__github_repo__}")
+
+        self.parent.show_confirmation(
+            "Update Available",
+            message,
+            on_confirm,
+            confirm_text="Open GitHub",
+            cancel_text="Later"
+        )
+
+
+class NotificationPopup(QWidget):
+    """Modern notification popup that appears inside the app"""
+
+    def __init__(self, parent, message: str, duration: int = 3000, notification_type: str = "info"):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+
+        self.message = message
+        self.notification_type = notification_type  # "info", "success", "warning", "error"
+
+        # Setup UI
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 15, 20, 15)
+
+        self.label = QLabel(message)
+        self.label.setWordWrap(True)
+        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.label)
+
+        # Style based on type
+        self.update_style()
+
+        # Fade in animation
+        self.opacity_effect = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(self.opacity_effect)
+        self.fade_animation = QPropertyAnimation(self.opacity_effect, b"opacity")
+        self.fade_animation.setDuration(300)
+        self.fade_animation.setStartValue(0.0)
+        self.fade_animation.setEndValue(1.0)
+        self.fade_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+        # Auto-hide timer
+        self.hide_timer = QTimer(self)
+        self.hide_timer.setSingleShot(True)
+        self.hide_timer.timeout.connect(self.fade_out)
+        self.hide_timer.start(duration)
+
+    def update_style(self):
+        """Update style based on notification type"""
+        colors = {
+            "info": ("rgba(60, 120, 200, 220)", "rgba(255, 255, 255, 255)"),
+            "success": ("rgba(60, 180, 100, 220)", "rgba(255, 255, 255, 255)"),
+            "warning": ("rgba(220, 160, 40, 220)", "rgba(40, 40, 40, 255)"),
+            "error": ("rgba(220, 60, 60, 220)", "rgba(255, 255, 255, 255)"),
+        }
+
+        bg_color, text_color = colors.get(self.notification_type, colors["info"])
+
+        self.setStyleSheet(f"""
+            QWidget {{
+                background-color: {bg_color};
+                border-radius: 12px;
+                border: 1px solid rgba(255, 255, 255, 30);
+            }}
+            QLabel {{
+                color: {text_color};
+                font-size: 14px;
+                font-weight: 500;
+                background: transparent;
+                padding: 5px;
+            }}
+        """)
+
+    def showEvent(self, event):
+        """Position popup at top center of parent"""
+        super().showEvent(event)
+        if self.parent():
+            parent_rect = self.parent().rect()
+            self.adjustSize()
+            x = (parent_rect.width() - self.width()) // 2
+            y = 40  # 40px from top
+            self.move(x, y)
+            self.fade_animation.start()
+
+    def fade_out(self):
+        """Fade out and close"""
+        fade_out_anim = QPropertyAnimation(self.opacity_effect, b"opacity")
+        fade_out_anim.setDuration(300)
+        fade_out_anim.setStartValue(1.0)
+        fade_out_anim.setEndValue(0.0)
+        fade_out_anim.setEasingCurve(QEasingCurve.Type.InCubic)
+        fade_out_anim.finished.connect(self.close)
+        fade_out_anim.start()
+
+
+class ConfirmationPopup(QWidget):
+    """Modern confirmation dialog inside the app"""
+    confirmed = pyqtSignal()
+    cancelled = pyqtSignal()
+
+    def __init__(self, parent, title: str, message: str, confirm_text: str = "Yes", cancel_text: str = "No"):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+        # Semi-transparent background overlay
+        self.overlay = QWidget(self)
+        self.overlay.setStyleSheet("background-color: rgba(0, 0, 0, 150);")
+
+        # Main dialog container
+        container = QFrame(self)
+        container.setStyleSheet("""
+            QFrame {
+                background-color: rgba(40, 40, 40, 240);
+                border-radius: 16px;
+                border: 1px solid rgba(255, 255, 255, 30);
+            }
+        """)
+
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(30, 25, 30, 25)
+        layout.setSpacing(20)
+
+        # Title
+        title_label = QLabel(title)
+        title_label.setStyleSheet("""
+            QLabel {
+                color: white;
+                font-size: 18px;
+                font-weight: bold;
+                background: transparent;
+            }
+        """)
+        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title_label)
+
+        # Message
+        message_label = QLabel(message)
+        message_label.setWordWrap(True)
+        message_label.setStyleSheet("""
+            QLabel {
+                color: rgba(255, 255, 255, 200);
+                font-size: 14px;
+                background: transparent;
+            }
+        """)
+        message_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(message_label)
+
+        # Buttons
+        button_layout = QHBoxLayout()
+        button_layout.setSpacing(15)
+
+        self.cancel_btn = QPushButton(cancel_text)
+        self.cancel_btn.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(70, 70, 70, 255);
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 12px 30px;
+                font-size: 14px;
+                font-weight: 500;
+            }
+            QPushButton:hover {
+                background-color: rgba(90, 90, 90, 255);
+            }
+            QPushButton:pressed {
+                background-color: rgba(60, 60, 60, 255);
+            }
+        """)
+        self.cancel_btn.clicked.connect(self.on_cancel)
+        button_layout.addWidget(self.cancel_btn)
+
+        self.confirm_btn = QPushButton(confirm_text)
+        self.confirm_btn.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(220, 60, 60, 255);
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 12px 30px;
+                font-size: 14px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: rgba(240, 80, 80, 255);
+            }
+            QPushButton:pressed {
+                background-color: rgba(200, 50, 50, 255);
+            }
+        """)
+        self.confirm_btn.clicked.connect(self.on_confirm)
+        button_layout.addWidget(self.confirm_btn)
+
+        layout.addLayout(button_layout)
+
+        self.container = container
+        self.container.setFixedWidth(400)
+
+        # Fade in animation
+        self.opacity_effect = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(self.opacity_effect)
+        self.fade_animation = QPropertyAnimation(self.opacity_effect, b"opacity")
+        self.fade_animation.setDuration(200)
+        self.fade_animation.setStartValue(0.0)
+        self.fade_animation.setEndValue(1.0)
+        self.fade_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+    def showEvent(self, event):
+        """Position popup at center of parent"""
+        super().showEvent(event)
+        if self.parent():
+            parent_rect = self.parent().rect()
+
+            # Overlay covers entire parent
+            self.overlay.setGeometry(parent_rect)
+
+            # Center the container
+            self.container.adjustSize()
+            x = (parent_rect.width() - self.container.width()) // 2
+            y = (parent_rect.height() - self.container.height()) // 2
+            self.container.move(x, y)
+
+            # Make popup cover entire parent for overlay effect
+            self.setGeometry(parent_rect)
+
+            self.fade_animation.start()
+
+    def on_confirm(self):
+        """Handle confirm button"""
+        self.confirmed.emit()
+        self.close()
+
+    def on_cancel(self):
+        """Handle cancel button"""
+        self.cancelled.emit()
+        self.close()
 
 
 class SlideType(Enum):
@@ -2305,54 +2531,14 @@ class NDotClockSlider(QWidget):
         if slide['type'] == SlideType.CLOCK:
             return  # Cannot delete clock slide
 
-        msg = QMessageBox(self)
-        msg.setWindowTitle(self._tr("delete_confirm_title"))
-        msg.setText(self._tr("delete_confirm_message"))
-        msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        msg.setDefaultButton(QMessageBox.StandardButton.No)
-
-        # Apply dark theme styling
-        msg.setStyleSheet(f"""
-            QMessageBox {{
-                background-color: rgba(30, 30, 30, 250);
-                color: #f0f0f0;
-                border: 2px solid rgba(255, 255, 255, 35);
-                border-radius: 12px;
-                font-family: '{self.font_family}';
-            }}
-            QMessageBox QPushButton {{
-                background-color: rgba(255, 255, 255, 20);
-                border: 1px solid rgba(255, 255, 255, 55);
-                border-radius: 8px;
-                padding: 8px 16px;
-                color: #f0f0f0;
-                font-weight: 500;
-                min-width: 60px;
-                font-family: '{self.font_family}';
-            }}
-            QMessageBox QPushButton:hover {{
-                background-color: rgba(255, 255, 255, 35);
-            }}
-            QMessageBox QPushButton:default {{
-                background-color: #ffffff;
-                color: #151515;
-                font-weight: 600;
-            }}
-            QMessageBox QPushButton:default:hover {{
-                background-color: #e6e6e6;
-            }}
-        """)
-
-        yes_button = msg.button(QMessageBox.StandardButton.Yes)
-        no_button = msg.button(QMessageBox.StandardButton.No)
-        if yes_button:
-            yes_button.setText(self._tr("yes_button"))
-        if no_button:
-            no_button.setText(self._tr("no_button"))
-
-        result = msg.exec()
-        if result == QMessageBox.StandardButton.Yes:
-            self.delete_current_card()
+        # Use internal confirmation popup
+        self.show_confirmation(
+            self._tr("delete_confirm_title"),
+            self._tr("delete_confirm_message"),
+            self.delete_current_card,
+            confirm_text=self._tr("yes_button"),
+            cancel_text=self._tr("no_button")
+        )
 
     def delete_current_card(self):
         """Delete the currently edited card"""
@@ -4227,6 +4413,25 @@ class NDotClockSlider(QWidget):
             self._colon_color = QColor(color)
             self._update_cached_colors()
             self.update()
+
+    def show_notification(self, message: str, duration: int = 3000, notification_type: str = "info"):
+        """Show internal notification popup"""
+        popup = NotificationPopup(self, message, duration, notification_type)
+        popup.show()
+
+    def show_confirmation(self, title: str, message: str, on_confirm, confirm_text: str = "Yes", cancel_text: str = "No"):
+        """Show internal confirmation dialog
+
+        Args:
+            title: Dialog title
+            message: Dialog message
+            on_confirm: Callback function to call when confirmed
+            confirm_text: Text for confirm button
+            cancel_text: Text for cancel button
+        """
+        popup = ConfirmationPopup(self, title, message, confirm_text, cancel_text)
+        popup.confirmed.connect(on_confirm)
+        popup.show()
 
     def _update_digit_animations(self) -> bool:
         """Update digit change animations, returns True if any animation is active"""
