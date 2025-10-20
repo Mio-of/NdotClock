@@ -5,7 +5,7 @@ import os
 import webbrowser
 from datetime import datetime
 from enum import Enum
-from typing import Dict, Set, Optional, Tuple
+from typing import Dict, Set, Optional, Tuple, List
 
 from PyQt6.QtCore import (QTimer, Qt, QPropertyAnimation, QEasingCurve,
                           pyqtSignal, QRect, QRectF, QPoint, QPointF, pyqtProperty, QUrl, QEvent, QThread)
@@ -23,7 +23,7 @@ from PyQt6.QtWebEngineCore import QWebEngineSettings, QWebEngineProfile, QWebEng
 from urllib.parse import urlencode
 
 # Version info
-__version__ = "1.1.1"
+__version__ = "1.1.2"
 __github_repo__ = "Mio-of/NdotClock"
 __github_branch__ = "main"
 __github_api_commits_url__ = f"https://api.github.com/repos/{__github_repo__}/commits/{__github_branch__}"
@@ -866,6 +866,8 @@ class ModernSlider(QSlider):
 class NDotClockSlider(QWidget):
     """Main clock application with slider interface"""
 
+    INACTIVITY_TIMEOUT = 60000  # 1 minute in milliseconds
+
     @staticmethod
     def get_resource_dir(subdir=''):
         """Get resource directory path, compatible with PyInstaller and development"""
@@ -883,13 +885,13 @@ class NDotClockSlider(QWidget):
     @staticmethod
     def get_config_dir():
         """Get platform-specific user config directory for settings"""
-        app_name = "ndot_clock"
+        app_name = "Ndot Clock"
 
         if sys.platform == 'win32':
-            # Windows: %APPDATA%\ndot_clock
+            # Windows: %APPDATA%\Ndot Clock
             config_dir = os.path.join(os.environ.get('APPDATA', ''), app_name)
         elif sys.platform == 'darwin':
-            # macOS: ~/Library/Application Support/ndot_clock
+            # macOS: ~/Library/Application Support/Ndot Clock
             config_dir = os.path.join(os.path.expanduser('~'), 'Library', 'Application Support', app_name)
         else:
             # Linux/Unix: ~/.config/ndot_clock
@@ -922,7 +924,7 @@ class NDotClockSlider(QWidget):
 
     TRANSLATIONS = {
         "EN": {
-            "window_title": "N-Dot Clock Slider",
+            "window_title": "N-Dot Clock",
             "edit_hint": "EDIT MODE: CLICK A CARD TO MODIFY",
             "add_card_slide_label": "ADD CARD",
             "add_menu_title": "ADD CARD",
@@ -961,7 +963,7 @@ class NDotClockSlider(QWidget):
             "no_button": "No",
         },
         "RU": {
-            "window_title": "Слайдер N-Dot Clock",
+            "window_title": "N-Dot Clock",
             "edit_hint": "РЕЖИМ РЕДАКТИРОВАНИЯ: НАЖМИТЕ НА КАРТУ ДЛЯ ИЗМЕНЕНИЯ",
             "add_card_slide_label": "ДОБАВИТЬ КАРТУ",
             "add_menu_title": "ДОБАВИТЬ КАРТУ",
@@ -1000,7 +1002,7 @@ class NDotClockSlider(QWidget):
             "no_button": "Нет",
         },
         "UA": {
-            "window_title": "Повзунок N-Dot Clock",
+            "window_title": "N-Dot Clock",
             "edit_hint": "РЕЖИМ РЕДАГУВАННЯ: НАТИСНІТЬ НА КАРТКУ, ЩОБ ЗМІНИТИ",
             "add_card_slide_label": "ДОДАТИ КАРТКУ",
             "add_menu_title": "ДОДАТИ КАРТКУ",
@@ -1058,7 +1060,7 @@ class NDotClockSlider(QWidget):
                             break
         
         # Settings defaults - use platform-specific config directory
-        self.settings_file = os.path.join(self.get_config_dir(), 'ndot_clock_slider_settings.json')
+        self.settings_file = os.path.join(self.get_config_dir(), 'ndot_clock_settings.json')
         self.default_settings = {
             'user_brightness': 0.8,
             'digit_color': (246, 246, 255),
@@ -1069,7 +1071,7 @@ class NDotClockSlider(QWidget):
             'location': {'lat': None, 'lon': None}
         }
 
-        self.setWindowTitle("ndot clock")
+        self.setWindowTitle("Ndot Clock")
         self.resize(800, 480)
         self.setMinimumSize(800, 480)
 
@@ -1280,6 +1282,11 @@ class NDotClockSlider(QWidget):
         self.update_check_timer.setSingleShot(True)
         self.update_check_timer.timeout.connect(lambda: self.update_checker.check_for_updates(silent=True))
         self.update_check_timer.start(5000)  # 5 seconds delay
+
+        # Clock return timer - return to clock after inactivity
+        self.clock_return_timer = QTimer(self)
+        self.clock_return_timer.setSingleShot(True)
+        self.clock_return_timer.timeout.connect(self.return_to_clock)
 
         # Navigation inactivity
         self.reset_navigation_timer()
@@ -1681,6 +1688,31 @@ class NDotClockSlider(QWidget):
         if not self.edit_mode:
             self.show_navigation()
             self.nav_hide_timer.start(10000)
+            # Also reset the clock return timer if we're not on the clock slide
+            self.reset_clock_return_timer()
+
+    def reset_clock_return_timer(self):
+        """Reset the timer that returns to clock slide after inactivity"""
+        # Only start timer if we're not on clock slide and not in edit mode
+        if not self.edit_mode and self.current_slide > 0:
+            # Find the clock slide (should be at index 0)
+            has_clock = any(slide["type"] == SlideType.CLOCK for slide in self.slides)
+            if has_clock:
+                self.clock_return_timer.start(self.INACTIVITY_TIMEOUT)
+        else:
+            self.clock_return_timer.stop()
+
+    def return_to_clock(self):
+        """Return to clock slide after inactivity timeout"""
+        if not self.edit_mode and self.current_slide > 0:
+            # Find the clock slide (should be at index 0)
+            clock_index = next((i for i, slide in enumerate(self.slides) 
+                              if slide["type"] == SlideType.CLOCK), -1)
+            if clock_index >= 0:
+                self.current_slide = clock_index
+                self.animate_to_current_slide()
+                self.update()
+                self.update_active_webviews()
 
     def show_navigation(self):
         """Show navigation dots"""
@@ -1849,6 +1881,9 @@ class NDotClockSlider(QWidget):
     def mousePressEvent(self, event: QMouseEvent):
         """Handle mouse press"""
         if event.button() == Qt.MouseButton.LeftButton:
+            # Reset clock return timer on user interaction
+            self.reset_clock_return_timer()
+            
             if self.card_edit_mode:
                 self.exit_card_edit_mode()
             elif self.edit_mode:
@@ -3198,6 +3233,7 @@ class NDotClockSlider(QWidget):
             self.current_slide += 1
             self.animate_to_current_slide()
             self.reset_navigation_timer()
+            self.reset_clock_return_timer()
             self.update()
             self.update_active_webviews()
 
@@ -3209,6 +3245,7 @@ class NDotClockSlider(QWidget):
             self.current_slide -= 1
             self.animate_to_current_slide()
             self.reset_navigation_timer()
+            self.reset_clock_return_timer()
             self.update()
             self.update_active_webviews()
 
@@ -3904,6 +3941,9 @@ class NDotClockSlider(QWidget):
 
     def keyPressEvent(self, event):
         """Handle key press"""
+        # Reset clock return timer on user interaction
+        self.reset_clock_return_timer()
+
         # Ignore arrow keys if modifier keys are pressed (prevents language change from triggering navigation)
         modifiers = event.modifiers()
         has_modifiers = (modifiers & (Qt.KeyboardModifier.ShiftModifier |
@@ -5219,6 +5259,8 @@ class NDotClockSlider(QWidget):
                 self.nav_hide_timer.stop()
             if hasattr(self, 'long_press_timer'):
                 self.long_press_timer.stop()
+            if hasattr(self, 'clock_return_timer'):
+                self.clock_return_timer.stop()
 
             # Clean up animations
             if hasattr(self, '_webview_fade_animations'):
