@@ -23,7 +23,7 @@ from PyQt6.QtWebEngineCore import QWebEngineSettings, QWebEngineProfile, QWebEng
 from urllib.parse import urlencode
 
 # Version info
-__version__ = "1.1.2"
+__version__ = "1.1.3"
 __github_repo__ = "Mio-of/NdotClock"
 __github_branch__ = "main"
 __github_api_commits_url__ = f"https://api.github.com/repos/{__github_repo__}/commits/{__github_branch__}"
@@ -288,6 +288,229 @@ class UpdateChecker:
                 duration=5000,
                 notification_type="error"
             )
+
+
+class AutostartManager:
+    """Manage application autostart across different platforms"""
+
+    @staticmethod
+    def get_autostart_status() -> bool:
+        """Check if autostart is enabled"""
+        try:
+            if sys.platform == 'win32':
+                return AutostartManager._check_windows_autostart()
+            elif sys.platform == 'darwin':
+                return AutostartManager._check_macos_autostart()
+            else:  # Linux
+                return AutostartManager._check_linux_autostart()
+        except Exception as e:
+            print(f"Error checking autostart status: {e}")
+            return False
+
+    @staticmethod
+    def enable_autostart() -> bool:
+        """Enable autostart for the application"""
+        try:
+            if sys.platform == 'win32':
+                return AutostartManager._enable_windows_autostart()
+            elif sys.platform == 'darwin':
+                return AutostartManager._enable_macos_autostart()
+            else:  # Linux
+                return AutostartManager._enable_linux_autostart()
+        except Exception as e:
+            print(f"Error enabling autostart: {e}")
+            return False
+
+    @staticmethod
+    def disable_autostart() -> bool:
+        """Disable autostart for the application"""
+        try:
+            if sys.platform == 'win32':
+                return AutostartManager._disable_windows_autostart()
+            elif sys.platform == 'darwin':
+                return AutostartManager._disable_macos_autostart()
+            else:  # Linux
+                return AutostartManager._disable_linux_autostart()
+        except Exception as e:
+            print(f"Error disabling autostart: {e}")
+            return False
+
+    # Windows implementation
+    @staticmethod
+    def _check_windows_autostart() -> bool:
+        """Check Windows autostart via registry"""
+        import winreg
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                r"Software\Microsoft\Windows\CurrentVersion\Run",
+                                0, winreg.KEY_READ)
+            try:
+                winreg.QueryValueEx(key, "NdotClock")
+                winreg.CloseKey(key)
+                return True
+            except FileNotFoundError:
+                winreg.CloseKey(key)
+                return False
+        except Exception:
+            return False
+
+    @staticmethod
+    def _enable_windows_autostart() -> bool:
+        """Enable Windows autostart via registry"""
+        import winreg
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                r"Software\Microsoft\Windows\CurrentVersion\Run",
+                                0, winreg.KEY_SET_VALUE)
+
+            # Get executable path
+            if getattr(sys, 'frozen', False):
+                exe_path = sys.executable
+            else:
+                # For development, use pythonw to avoid console window
+                python_path = sys.executable.replace('python.exe', 'pythonw.exe')
+                script_path = os.path.abspath(__file__)
+                exe_path = f'"{python_path}" "{script_path}"'
+
+            winreg.SetValueEx(key, "NdotClock", 0, winreg.REG_SZ, exe_path)
+            winreg.CloseKey(key)
+            return True
+        except Exception as e:
+            print(f"Windows autostart error: {e}")
+            return False
+
+    @staticmethod
+    def _disable_windows_autostart() -> bool:
+        """Disable Windows autostart via registry"""
+        import winreg
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                r"Software\Microsoft\Windows\CurrentVersion\Run",
+                                0, winreg.KEY_SET_VALUE)
+            try:
+                winreg.DeleteValue(key, "NdotClock")
+                winreg.CloseKey(key)
+                return True
+            except FileNotFoundError:
+                winreg.CloseKey(key)
+                return True  # Already disabled
+        except Exception as e:
+            print(f"Windows autostart disable error: {e}")
+            return False
+
+    # macOS implementation
+    @staticmethod
+    def _check_macos_autostart() -> bool:
+        """Check macOS autostart via LaunchAgents"""
+        plist_path = os.path.expanduser("~/Library/LaunchAgents/com.ndotclock.plist")
+        return os.path.exists(plist_path)
+
+    @staticmethod
+    def _enable_macos_autostart() -> bool:
+        """Enable macOS autostart via LaunchAgents"""
+        plist_path = os.path.expanduser("~/Library/LaunchAgents/com.ndotclock.plist")
+
+        # Get executable path
+        if getattr(sys, 'frozen', False):
+            exe_path = sys.executable
+        else:
+            exe_path = sys.executable
+            script_path = os.path.abspath(__file__)
+
+        plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ndotclock</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{exe_path}</string>"""
+
+        if not getattr(sys, 'frozen', False):
+            plist_content += f"""
+        <string>{script_path}</string>"""
+
+        plist_content += """
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+</dict>
+</plist>
+"""
+
+        try:
+            os.makedirs(os.path.dirname(plist_path), exist_ok=True)
+            with open(plist_path, 'w') as f:
+                f.write(plist_content)
+            return True
+        except Exception as e:
+            print(f"macOS autostart error: {e}")
+            return False
+
+    @staticmethod
+    def _disable_macos_autostart() -> bool:
+        """Disable macOS autostart via LaunchAgents"""
+        plist_path = os.path.expanduser("~/Library/LaunchAgents/com.ndotclock.plist")
+        try:
+            if os.path.exists(plist_path):
+                os.remove(plist_path)
+            return True
+        except Exception as e:
+            print(f"macOS autostart disable error: {e}")
+            return False
+
+    # Linux implementation
+    @staticmethod
+    def _check_linux_autostart() -> bool:
+        """Check Linux autostart via XDG autostart"""
+        desktop_path = os.path.expanduser("~/.config/autostart/ndotclock.desktop")
+        return os.path.exists(desktop_path)
+
+    @staticmethod
+    def _enable_linux_autostart() -> bool:
+        """Enable Linux autostart via XDG autostart"""
+        desktop_path = os.path.expanduser("~/.config/autostart/ndotclock.desktop")
+
+        # Get executable path
+        if getattr(sys, 'frozen', False):
+            exe_path = sys.executable
+        else:
+            exe_path = f"{sys.executable} {os.path.abspath(__file__)}"
+
+        desktop_content = f"""[Desktop Entry]
+Type=Application
+Name=Ndot Clock
+Exec={exe_path}
+Hidden=false
+NoDisplay=false
+X-GNOME-Autostart-enabled=true
+"""
+
+        try:
+            os.makedirs(os.path.dirname(desktop_path), exist_ok=True)
+            with open(desktop_path, 'w') as f:
+                f.write(desktop_content)
+            # Make executable
+            os.chmod(desktop_path, 0o755)
+            return True
+        except Exception as e:
+            print(f"Linux autostart error: {e}")
+            return False
+
+    @staticmethod
+    def _disable_linux_autostart() -> bool:
+        """Disable Linux autostart via XDG autostart"""
+        desktop_path = os.path.expanduser("~/.config/autostart/ndotclock.desktop")
+        try:
+            if os.path.exists(desktop_path):
+                os.remove(desktop_path)
+            return True
+        except Exception as e:
+            print(f"Linux autostart disable error: {e}")
+            return False
 
 
 class NotificationPopup(QWidget):
@@ -961,6 +1184,10 @@ class NDotClockSlider(QWidget):
             "delete_confirm_message": "Are you sure you want to delete this card?",
             "yes_button": "Yes",
             "no_button": "No",
+            "autostart_button": "Autostart",
+            "autostart_enabled": "Autostart enabled",
+            "autostart_disabled": "Autostart disabled",
+            "autostart_error": "Failed to configure autostart",
         },
         "RU": {
             "window_title": "N-Dot Clock",
@@ -1000,6 +1227,10 @@ class NDotClockSlider(QWidget):
             "delete_confirm_message": "Вы уверены, что хотите удалить эту карту?",
             "yes_button": "Да",
             "no_button": "Нет",
+            "autostart_button": "Автозапуск",
+            "autostart_enabled": "Автозапуск включен",
+            "autostart_disabled": "Автозапуск выключен",
+            "autostart_error": "Ошибка настройки автозапуска",
         },
         "UA": {
             "window_title": "N-Dot Clock",
@@ -1039,6 +1270,10 @@ class NDotClockSlider(QWidget):
             "delete_confirm_message": "Ви впевнені, що хочете видалити цю картку?",
             "yes_button": "Так",
             "no_button": "Ні",
+            "autostart_button": "Автозапуск",
+            "autostart_enabled": "Автозапуск увімкнено",
+            "autostart_disabled": "Автозапуск вимкнено",
+            "autostart_error": "Помилка налаштування автозапуску",
         },
     }
     
@@ -2201,7 +2436,7 @@ class NDotClockSlider(QWidget):
         self.reorder_card_offsets.clear()
 
     def check_language_button_click(self, pos: QPoint) -> bool:
-        """Check if language button or update button was clicked"""
+        """Check if language button, update button, or autostart button was clicked"""
         if not self.edit_mode:
             return False
 
@@ -2210,6 +2445,14 @@ class NDotClockSlider(QWidget):
         lang_button_width = int(54 * self.scale_factor)
         lang_button_height = int(24 * self.scale_factor)
         lang_spacing = int(12 * self.scale_factor)
+
+        # Check autostart button (on the left)
+        autostart_button_width = int(100 * self.scale_factor)
+        autostart_x = int(20 * self.scale_factor)
+        if (autostart_x <= pos.x() <= autostart_x + autostart_button_width and
+            lang_y <= pos.y() <= lang_y + lang_button_height):
+            self.toggle_autostart()
+            return True
 
         # Check update button (on the right)
         update_button_width = int(100 * self.scale_factor)
@@ -2266,6 +2509,44 @@ class NDotClockSlider(QWidget):
         else:
             self.showNormal()
         self.save_settings()
+        self.update()
+
+    def toggle_autostart(self):
+        """Toggle autostart on/off"""
+        current_status = AutostartManager.get_autostart_status()
+
+        if current_status:
+            # Disable autostart
+            success = AutostartManager.disable_autostart()
+            if success:
+                self.show_notification(
+                    self._tr("autostart_disabled"),
+                    duration=3000,
+                    notification_type="info"
+                )
+            else:
+                self.show_notification(
+                    self._tr("autostart_error"),
+                    duration=4000,
+                    notification_type="error"
+                )
+        else:
+            # Enable autostart
+            success = AutostartManager.enable_autostart()
+            if success:
+                self.show_notification(
+                    self._tr("autostart_enabled"),
+                    duration=3000,
+                    notification_type="success"
+                )
+            else:
+                self.show_notification(
+                    self._tr("autostart_error"),
+                    duration=4000,
+                    notification_type="error"
+                )
+
+        # Update UI to reflect new state
         self.update()
 
     def is_click_on_current_card(self, pos: QPoint) -> bool:
@@ -5046,6 +5327,25 @@ class NDotClockSlider(QWidget):
 
         painter.setPen(QColor(220, 220, 220))
         painter.drawText(update_rect, Qt.AlignmentFlag.AlignCenter, f"v{__version__}")
+
+        # Draw autostart button on the left
+        autostart_button_width = int(100 * self.scale_factor)
+        autostart_x = int(20 * self.scale_factor)
+        autostart_rect = QRectF(autostart_x, lang_y, autostart_button_width, lang_button_height)
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        # Check if autostart is enabled
+        autostart_enabled = AutostartManager.get_autostart_status()
+        if autostart_enabled:
+            painter.setBrush(QColor(60, 180, 100))  # Green when enabled
+            text_color = QColor(255, 255, 255)
+        else:
+            painter.setBrush(QColor(70, 70, 70))
+            text_color = QColor(220, 220, 220)
+
+        painter.drawRoundedRect(autostart_rect, radius, radius)
+        painter.setPen(text_color)
+        painter.drawText(autostart_rect, Qt.AlignmentFlag.AlignCenter, self._tr("autostart_button"))
 
     def save_settings(self):
         """Save settings to file"""
