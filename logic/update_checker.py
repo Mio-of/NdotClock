@@ -50,6 +50,19 @@ class UpdateChecker:
         self.download_popup_factory = download_popup_factory
         self.download_progress_popup = None
 
+    @staticmethod
+    def _apply_redirect_policy(request: QNetworkRequest) -> None:
+        """Enable automatic redirect following when supported by Qt build."""
+        follow_attr = getattr(QNetworkRequest.Attribute, "FollowRedirectsAttribute", None)
+        if follow_attr is not None:
+            request.setAttribute(follow_attr, True)
+            return
+
+        redirect_attr = getattr(QNetworkRequest.Attribute, "RedirectPolicyAttribute", None)
+        redirect_policy = getattr(QNetworkRequest.RedirectPolicy, "NoLessSafeRedirectPolicy", None)
+        if redirect_attr is not None and redirect_policy is not None:
+            request.setAttribute(redirect_attr, redirect_policy)
+
     def check_for_updates(self, silent: bool = False):
         """Check for updates from GitHub main branch
 
@@ -62,7 +75,7 @@ class UpdateChecker:
         # First, get the latest commit info to check version
         request = QNetworkRequest(QUrl(__github_api_commits_url__))
         request.setHeader(QNetworkRequest.KnownHeaders.UserAgentHeader, f"NdotClock/{__version__}")
-        request.setAttribute(QNetworkRequest.Attribute.FollowRedirectsAttribute, True)
+        self._apply_redirect_policy(request)
         self.network_manager.get(request)
 
     def _on_update_check_finished(self, reply: QNetworkReply):
@@ -97,7 +110,7 @@ class UpdateChecker:
                 request = QNetworkRequest(QUrl(__github_version_file_url__))
                 # исправлено: сравниваем версии по актуальному файлу конфигурации на GitHub
                 request.setHeader(QNetworkRequest.KnownHeaders.UserAgentHeader, f"NdotClock/{__version__}")
-                request.setAttribute(QNetworkRequest.Attribute.FollowRedirectsAttribute, True)
+                self._apply_redirect_policy(request)
                 self.network_manager.get(request)
 
             elif self.current_request_type == 'version_check':
@@ -211,7 +224,7 @@ class UpdateChecker:
         request = QNetworkRequest(QUrl(__github_archive_url__))
         # исправлено: скачиваем zip-архив репозитория вместо одиночного скрипта
         request.setHeader(QNetworkRequest.KnownHeaders.UserAgentHeader, f"NdotClock/{__version__}")
-        request.setAttribute(QNetworkRequest.Attribute.FollowRedirectsAttribute, True)
+        self._apply_redirect_policy(request)
 
         reply = self.network_manager.get(request)
         reply.downloadProgress.connect(self._on_download_progress)
