@@ -29,7 +29,20 @@ def _install_simplejpeg_stub(exc: BaseException) -> None:
     if "simplejpeg" in sys.modules:
         return
     module = types.ModuleType("simplejpeg")
-    message = f"simplejpeg unavailable ({exc})"
+    
+    # Проверяем, что ошибка связана с numpy/simplejpeg несовместимостью
+    error_msg = str(exc).lower()
+    is_numpy_compatibility_error = (
+        "numpy.dtype" in error_msg or 
+        "binary incompatibility" in error_msg or
+        "expected" in error_msg and "got" in error_msg
+    )
+    
+    if is_numpy_compatibility_error:
+        message = f"simplejpeg unavailable (numpy compatibility issue: {exc})"
+    else:
+        message = f"simplejpeg unavailable ({exc})"
+    
     global _SIMPLEJPEG_STUB_MESSAGE
     _SIMPLEJPEG_STUB_MESSAGE = message
 
@@ -42,7 +55,7 @@ def _install_simplejpeg_stub(exc: BaseException) -> None:
     module.decode_jpeg_yuv420 = _unsupported  # type: ignore[attr-defined]
     module.__all__ = [
         "encode_jpeg",
-        "encode_jpeg_yuv_planes",
+        "encode_jpeg_yuv_planes", 
         "decode_jpeg",
         "decode_jpeg_yuv420",
     ]
@@ -71,7 +84,12 @@ def _ensure_picamera2():
             ], capture_output=True, text=True, timeout=5)
             
             if result.returncode != 0 or "OK" not in result.stdout:
-                raise ImportError(f"picamera2 test failed: {result.stderr}")
+                error_output = result.stderr.strip()
+                # Проверяем на специфические ошибки numpy/simplejpeg
+                if "numpy.dtype" in error_output and "binary incompatibility" in error_output:
+                    raise ImportError(f"picamera2 numpy/simplejpeg incompatibility: {error_output}")
+                else:
+                    raise ImportError(f"picamera2 test failed: {error_output}")
                 
         except (subprocess.TimeoutExpired, subprocess.SubprocessError, FileNotFoundError):
             raise ImportError("picamera2 subprocess test failed")
@@ -82,7 +100,15 @@ def _ensure_picamera2():
         _PICAMERA2_CLASS = _Picamera2
         _PICAMERA2_IMPORT_ERROR = None
         return _PICAMERA2_CLASS
-    except Exception as exc:  # pragma: no cover - optional dependency on Raspberry Pi
+    except ImportError as exc:  # pragma: no cover - optional dependency on Raspberry Pi
+        # Проверяем на ошибку numpy/simplejpeg несовместимости
+        error_str = str(exc)
+        if "numpy/simplejpeg incompatibility" in error_str:
+            print(f"[AutoBrightness] picamera2 unavailable due to numpy/simplejpeg compatibility issue", file=sys.stderr, flush=True)
+            print(f"[AutoBrightness] This is a known issue on Raspberry Pi. Try: pip install --upgrade numpy simplejpeg", file=sys.stderr, flush=True)
+        else:
+            print(f"[AutoBrightness] picamera2 import error: {exc}", file=sys.stderr, flush=True)
+        
         # Attempt to stub simplejpeg (common failure on Raspberry Pi 5 with mismatched NumPy wheels)
         _install_simplejpeg_stub(exc)
         try:
@@ -97,7 +123,11 @@ def _ensure_picamera2():
                 ], capture_output=True, text=True, timeout=5)
                 
                 if result.returncode != 0 or "OK" not in result.stdout:
-                    raise ImportError(f"picamera2 test failed after stub: {result.stderr}")
+                    error_output = result.stderr.strip()
+                    if "numpy.dtype" in error_output and "binary incompatibility" in error_output:
+                        raise ImportError(f"picamera2 numpy/simplejpeg incompatibility after stub: {error_output}")
+                    else:
+                        raise ImportError(f"picamera2 test failed after stub: {error_output}")
                     
             except (subprocess.TimeoutExpired, subprocess.SubprocessError, FileNotFoundError):
                 raise ImportError("picamera2 subprocess test failed after stub")
@@ -107,9 +137,13 @@ def _ensure_picamera2():
             _PICAMERA2_CLASS = _Picamera2
             _PICAMERA2_IMPORT_ERROR = None
             return _PICAMERA2_CLASS
-        except Exception as retry_exc:  # pragma: no cover - optional dependency
+        except ImportError as retry_exc:  # pragma: no cover - optional dependency
             _PICAMERA2_IMPORT_ERROR = retry_exc
             return None
+    except Exception as exc:  # pragma: no cover - other unexpected errors
+        print(f"[AutoBrightness] Unexpected picamera2 error: {exc}", file=sys.stderr, flush=True)
+        _PICAMERA2_IMPORT_ERROR = exc
+        return None
 
 
 class _Picamera2Adapter:
@@ -225,7 +259,13 @@ class AmbientLightMonitor(QThread):
                 ], capture_output=True, text=True, timeout=3)
                 
                 if result.returncode != 0 or "OK" not in result.stdout:
-                    print(f"[AutoBrightness] ERROR: Picamera2 test failed: {result.stderr}", file=sys.stderr, flush=True)
+                    error_output = result.stderr.strip()
+                    # Проверяем на специфические ошибки numpy/simplejpeg
+                    if "numpy.dtype" in error_output and "binary incompatibility" in error_output:
+                        print(f"[AutoBrightness] ERROR: picamera2 numpy/simplejpeg compatibility issue", file=sys.stderr, flush=True)
+                        print(f"[AutoBrightness] Try: pip install --upgrade numpy simplejpeg", file=sys.stderr, flush=True)
+                    else:
+                        print(f"[AutoBrightness] ERROR: Picamera2 test failed: {error_output}", file=sys.stderr, flush=True)
                     self.errorOccurred.emit("missing_backend")
                     return
                     
@@ -296,7 +336,12 @@ class AmbientLightMonitor(QThread):
                         self._using_picamera2 = True
                         print("[AutoBrightness] Camera opened via Picamera2 fallback", file=sys.stderr, flush=True)
                 else:
-                    print(f"[AutoBrightness] Skipping Picamera2 due to test failure: {result.stderr}", file=sys.stderr, flush=True)
+                    error_output = result.stderr.strip()
+                    if "numpy.dtype" in error_output and "binary incompatibility" in error_output:
+                        print(f"[AutoBrightness] Skipping Picamera2 due to numpy/simplejpeg compatibility issue", file=sys.stderr, flush=True)
+                        print(f"[AutoBrightness] Try: pip install --upgrade numpy simplejpeg", file=sys.stderr, flush=True)
+                    else:
+                        print(f"[AutoBrightness] Skipping Picamera2 due to test failure: {error_output}", file=sys.stderr, flush=True)
                     
             except (subprocess.TimeoutExpired, subprocess.SubprocessError, FileNotFoundError, Exception) as e:
                 print(f"[AutoBrightness] Skipping Picamera2 due to subprocess error: {e}", file=sys.stderr, flush=True)
