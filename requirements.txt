@@ -1,0 +1,17 @@
+# N-Dot Clock Dependencies
+# Python 3.8+ required
+
+# Main GUI Framework
+PyQt6>=6.7.0
+PyQt6-sip>=13.6.0
+
+# WebEngine for YouTube and Home Assistant integration
+PyQt6-WebEngine>=6.7.0
+
+# Ambient light sensing (optional, for automatic brightness control)
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# Optional: For building standalone executables
+# Uncomment if you want to build with PyInstaller
+# pyinstaller>=6.0.0
