@@ -186,6 +186,9 @@ class NDotClockSlider(QWidget):
         self._min_brightness_update_interval = 0.05  # Минимум 50ms, может быть переопределено через переменную среды
         self._last_auto_sample_time = 0.0
         self._auto_brightness_last_interval = self.default_settings['auto_brightness_interval_ms'] / 1000.0
+        self._auto_log_last_measured: Optional[float] = None
+        self._auto_log_last_target: Optional[float] = None
+        self._auto_log_last_smoothed: Optional[float] = None
         # Анимация яркости с кривой Безье
         self._brightness_animation_target = self._manual_brightness
         self._brightness_animation = None  # Будет создана позже после инициализации виджета
@@ -198,6 +201,9 @@ class NDotClockSlider(QWidget):
         self._system_backlight: Optional[SystemBacklightController] = None
         self._system_backlight_error_notified = False
         self._system_backlight_verbose = os.environ.get("NDOT_SYSTEM_BACKLIGHT_VERBOSE", "").lower() in ("1", "true", "yes")
+        self._system_backlight_last_logged_raw: Optional[int] = None
+        self._system_backlight_last_ui_log: Optional[float] = None
+        self._backlight_last_apply_log: Optional[float] = None
         auto_verbose_env = os.environ.get("NDOT_AUTO_BRIGHTNESS_VERBOSE", "")
         self._auto_brightness_verbose = auto_verbose_env.lower() in ("1", "true", "yes") or self._system_backlight_verbose
         gamma_env = os.environ.get("NDOT_AUTO_BRIGHTNESS_GAMMA", "").strip()
@@ -4832,9 +4838,18 @@ class NDotClockSlider(QWidget):
                 print(f"[Backlight] No system backlight controller available", file=sys.stderr, flush=True)
             return
         try:
+            raw_value = int(round(value * self._system_backlight.max_brightness))
             if self._system_backlight_verbose:
-                raw_value = int(round(value * self._system_backlight.max_brightness))
-                print(f"[Backlight] Setting brightness to {value:.3f} ({raw_value}/{self._system_backlight.max_brightness})", file=sys.stderr, flush=True)
+                if (
+                    self._system_backlight_last_logged_raw is None
+                    or abs(self._system_backlight_last_logged_raw - raw_value) >= 2
+                ):
+                    print(
+                        f"[Backlight] Setting brightness to {value:.3f} ({raw_value}/{self._system_backlight.max_brightness})",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            self._system_backlight_last_logged_raw = raw_value
             self._system_backlight.set_level(value)
         except PermissionError as exc:
             if not self._system_backlight_error_notified:
@@ -4867,7 +4882,16 @@ class NDotClockSlider(QWidget):
         # - Управляем только системной подсветкой
         if self._auto_brightness_enabled and self._system_backlight:
             if self._system_backlight_verbose:
-                print(f"[Backlight] Auto-brightness mode: UI=1.0, Display={clamped:.3f}", file=sys.stderr, flush=True)
+                if (
+                    self._system_backlight_last_ui_log is None
+                    or abs(self._system_backlight_last_ui_log - clamped) >= 0.02
+                ):
+                    print(
+                        f"[Backlight] Auto-brightness mode: UI=1.0, Display={clamped:.3f}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    self._system_backlight_last_ui_log = clamped
             # Устанавливаем UI яркость на максимум, если она не максимальная
             if not math.isclose(self._user_brightness, 1.0, rel_tol=1e-3):
                 if self._system_backlight_verbose:
@@ -4898,8 +4922,19 @@ class NDotClockSlider(QWidget):
             self._manual_brightness = clamped
         
         if self._system_backlight_verbose:
-            mode = "AUTO" if from_auto else "MANUAL"
-            print(f"[Backlight] _apply_brightness({clamped:.3f}, from_auto={from_auto}) mode={mode}", file=sys.stderr, flush=True)
+            should_log = True
+            if from_auto:
+                if self._backlight_last_apply_log is not None and abs(self._backlight_last_apply_log - clamped) < 0.015:
+                    should_log = False
+            if should_log:
+                mode = "AUTO" if from_auto else "MANUAL"
+                print(
+                    f"[Backlight] _apply_brightness({clamped:.3f}, from_auto={from_auto}) mode={mode}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                if from_auto:
+                    self._backlight_last_apply_log = clamped
         
         # Для ручного управления - без анимации
         if not from_auto:
@@ -4907,6 +4942,7 @@ class NDotClockSlider(QWidget):
                 print(f"[Backlight] Manual mode: applying directly", file=sys.stderr, flush=True)
             self._apply_brightness_direct(clamped)
             self._sync_brightness_slider()
+            self._backlight_last_apply_log = None
             return
         
         # Для автояркости - с анимацией по кривой Безье
@@ -5111,7 +5147,12 @@ class NDotClockSlider(QWidget):
         self._last_auto_sample_time = current_time
 
         if self._auto_brightness_verbose:
-            print(f"[AutoBrightness] Measured ambient: {ambient:.3f}", file=sys.stderr, flush=True)
+            if (
+                self._auto_log_last_measured is None
+                or abs(self._auto_log_last_measured - ambient) >= 0.02
+            ):
+                print(f"[AutoBrightness] Measured ambient: {ambient:.3f}", file=sys.stderr, flush=True)
+                self._auto_log_last_measured = ambient
         
         # Добавляем измерение в буфер
         self._ambient_brightness_buffer.append(ambient)
@@ -5133,11 +5174,8 @@ class NDotClockSlider(QWidget):
         
         target = self._map_ambient_to_user_brightness(filtered_ambient)
         
-        if self._auto_brightness_verbose:
-            print(f"[AutoBrightness] Filtered: {filtered_ambient:.3f}, Target: {target:.3f}", file=sys.stderr, flush=True)
-        
-        # Упрощённое сглаживание - анимация Безье обеспечит плавность
-        # Лёгкое сглаживание только для устранения шума
+        previous_smoothed = self._auto_brightness_smoothed
+
         if not self._auto_brightness_has_sample:
             self._auto_brightness_has_sample = True
             self._auto_brightness_smoothed = target
@@ -5148,20 +5186,39 @@ class NDotClockSlider(QWidget):
             )
         
         if self._auto_brightness_verbose:
-            print(f"[AutoBrightness] Smoothed: {self._auto_brightness_smoothed:.3f}", file=sys.stderr, flush=True)
+            if (
+                self._auto_log_last_target is None
+                or abs(self._auto_log_last_target - target) >= 0.015
+                or self._auto_log_last_smoothed is None
+                or abs(self._auto_log_last_smoothed - self._auto_brightness_smoothed) >= 0.015
+            ):
+                print(
+                    "[AutoBrightness] ambient={:.3f} -> filtered={:.3f} -> target={:.3f} -> smoothed={:.3f}".format(
+                        ambient,
+                        filtered_ambient,
+                        target,
+                        self._auto_brightness_smoothed,
+                    ),
+                    file=sys.stderr,
+                    flush=True,
+                )
+                self._auto_log_last_target = target
+                self._auto_log_last_smoothed = self._auto_brightness_smoothed
         
         diff = abs(self._auto_brightness_smoothed - getattr(self, "_user_brightness", 0.8))
         
         # Ограничиваем частоту перерисовок для устранения лагов
         if current_time - self._last_brightness_update_time < self._min_brightness_update_interval:
-            # Пропускаем обновление, если прошло недостаточно времени
-            if self._auto_brightness_verbose:
-                print(f"[AutoBrightness] Skipping (too soon: {current_time - self._last_brightness_update_time:.3f}s)", file=sys.stderr, flush=True)
             return
         
         self._last_brightness_update_time = current_time
         if self._auto_brightness_verbose:
-            print(f"[AutoBrightness] Applying brightness: {self._auto_brightness_smoothed:.3f}", file=sys.stderr, flush=True)
+            if abs(self._auto_brightness_smoothed - previous_smoothed) >= 0.01:
+                print(
+                    f"[AutoBrightness] Applying brightness: {self._auto_brightness_smoothed:.3f}",
+                    file=sys.stderr,
+                    flush=True,
+                )
         self._apply_brightness(self._auto_brightness_smoothed, from_auto=True)
 
     def _on_ambient_light_error(self, error_code: str):
