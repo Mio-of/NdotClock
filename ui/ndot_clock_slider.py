@@ -4675,14 +4675,22 @@ class NDotClockSlider(QWidget):
     def _apply_brightness_direct(self, value: float):
         """Прямое применение яркости без анимации (используется внутри анимации)"""
         clamped = max(0.0, min(1.0, float(value)))
-        if math.isclose(clamped, getattr(self, "_user_brightness", 0.0), rel_tol=1e-3):
+        
+        # При включенной автояркости с системной подсветкой:
+        # - UI яркость всегда максимальная (1.0)
+        # - Управляем только системной подсветкой
+        if self._auto_brightness_enabled and self._system_backlight:
+            # Устанавливаем UI яркость на максимум, если она не максимальная
+            if not math.isclose(self._user_brightness, 1.0, rel_tol=1e-3):
+                self._user_brightness = 1.0
+                self._update_cached_colors()
+                self.update()
+            # Управляем только системной подсветкой
             self._apply_system_backlight(clamped)
             return
         
-        # При включенной автояркости приоритет отдаём системной подсветке
-        if self._auto_brightness_enabled and self._system_backlight:
-            # При автояркости управляем только системной подсветкой,
-            # не меняя программную яркость UI
+        # Обычный режим: проверяем, изменилась ли яркость
+        if math.isclose(clamped, getattr(self, "_user_brightness", 0.0), rel_tol=1e-3):
             self._apply_system_backlight(clamped)
             return
         
@@ -4960,6 +4968,14 @@ class NDotClockSlider(QWidget):
                         duration=3000,
                         notification_type="info",
                     )
+            
+            # При включении автояркости с системной подсветкой:
+            # устанавливаем UI яркость на максимум
+            if self._system_backlight:
+                if not math.isclose(self._user_brightness, 1.0, rel_tol=1e-3):
+                    self._user_brightness = 1.0
+                    self._update_cached_colors()
+                    self.update()
             
             # Очищаем буфер измерений при включении
             self._ambient_brightness_buffer.clear()
