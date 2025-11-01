@@ -440,7 +440,28 @@ class NDotClockSlider(QWidget):
         """Configure optional system backlight controller based on environment variables."""
         config_value = os.environ.get("NDOT_SYSTEM_BACKLIGHT", "").strip()
         if not config_value:
-            return
+            # Если системная подсветка не настроена, пробуем автоопределение
+            # для использования с автояркостью
+            controller = SystemBacklightController.auto_detect()
+            if controller:
+                self._system_backlight = controller
+                if self._system_backlight_verbose:
+                    print(
+                        f"[Backlight] Auto-detected system backlight device '{controller.name}' "
+                        f"(max={controller.max_brightness}) for auto-brightness",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                return
+            else:
+                if self._system_backlight_verbose:
+                    print(
+                        "[Backlight] No system backlight device found. "
+                        "Software brightness only.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                return
 
         controller = self._resolve_backlight_controller(config_value)
         if controller is None:
@@ -4657,6 +4678,14 @@ class NDotClockSlider(QWidget):
         if math.isclose(clamped, getattr(self, "_user_brightness", 0.0), rel_tol=1e-3):
             self._apply_system_backlight(clamped)
             return
+        
+        # При включенной автояркости приоритет отдаём системной подсветке
+        if self._auto_brightness_enabled and self._system_backlight:
+            # При автояркости управляем только системной подсветкой,
+            # не меняя программную яркость UI
+            self._apply_system_backlight(clamped)
+            return
+        
         self._user_brightness = clamped
         self._update_cached_colors()
         self.update()
@@ -4912,6 +4941,26 @@ class NDotClockSlider(QWidget):
         self._auto_brightness_smoothed = self._user_brightness
 
         if enabled:
+            # При включении автояркости пробуем найти системную подсветку,
+            # если она еще не инициализирована
+            if not self._system_backlight:
+                controller = SystemBacklightController.auto_detect()
+                if controller:
+                    self._system_backlight = controller
+                    if self._system_backlight_verbose:
+                        print(
+                            f"[Backlight] Auto-detected system backlight '{controller.name}' "
+                            f"for auto-brightness mode",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    # Показываем уведомление о переходе на системную подсветку
+                    self.show_notification(
+                        self._tr("auto_brightness_system_backlight_enabled"),
+                        duration=3000,
+                        notification_type="info",
+                    )
+            
             # Очищаем буфер измерений при включении
             self._ambient_brightness_buffer.clear()
             self._teardown_ambient_monitor()
@@ -4926,6 +4975,7 @@ class NDotClockSlider(QWidget):
             self._ambient_light_monitor.start()
         else:
             self._teardown_ambient_monitor()
+            # При выключении возвращаемся к ручному управлению яркостью UI
             self._apply_brightness(self._manual_brightness, from_auto=False)
 
         self._set_auto_brightness_controls_state()
