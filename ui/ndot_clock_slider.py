@@ -4944,6 +4944,11 @@ class NDotClockSlider(QWidget):
             self._sync_brightness_slider()
             self._backlight_last_apply_log = None
             return
+
+        if self._auto_brightness_enabled and self._system_backlight:
+            # При управлении аппаратной подсветкой нет смысла запускать UI-анимацию
+            self._apply_brightness_direct(clamped)
+            return
         
         # Для автояркости - с анимацией по кривой Безье
         if not self._brightness_animation:
@@ -4962,20 +4967,13 @@ class NDotClockSlider(QWidget):
         
         diff = abs(clamped - current_brightness)
         
-        # Адаптивная длительность: подстраиваемся под скорость изменения освещенности
-        interval = max(0.05, getattr(self, "_auto_brightness_last_interval", self._auto_brightness_interval_ms / 1000.0))
-        rate = diff / interval if interval > 0 else diff / 0.05
-        if rate > 1.4:
-            duration = 320
-        elif rate > 0.8:
-            duration = 420
-        elif rate > 0.4:
-            duration = 560
-        elif diff > 0.12:
-            duration = 650
+        # Адаптивная длительность: быстрее для больших изменений
+        if diff > 0.2:
+            duration = 450  # Быстрее для больших изменений
+        elif diff > 0.1:
+            duration = 600  # Средне
         else:
-            duration = 780
-        duration = max(220, int(duration))
+            duration = 750  # Плавно для малых изменений
         
         if self._system_backlight_verbose:
             print(f"[Backlight] Starting animation: {current_brightness:.3f} -> {clamped:.3f} (diff={diff:.3f}, duration={duration}ms)", file=sys.stderr, flush=True)
@@ -5137,15 +5135,6 @@ class NDotClockSlider(QWidget):
         if not self._auto_brightness_enabled:
             return
         
-        current_time = time.time()
-        sample_interval = (
-            current_time - self._last_auto_sample_time
-            if self._last_auto_sample_time > 0.0
-            else self._auto_brightness_interval_ms / 1000.0
-        )
-        self._auto_brightness_last_interval = max(0.02, sample_interval)
-        self._last_auto_sample_time = current_time
-
         if self._auto_brightness_verbose:
             if (
                 self._auto_log_last_measured is None
@@ -5208,6 +5197,7 @@ class NDotClockSlider(QWidget):
         diff = abs(self._auto_brightness_smoothed - getattr(self, "_user_brightness", 0.8))
         
         # Ограничиваем частоту перерисовок для устранения лагов
+        current_time = time.time()
         if current_time - self._last_brightness_update_time < self._min_brightness_update_interval:
             return
         
