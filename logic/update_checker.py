@@ -49,6 +49,7 @@ class UpdateChecker:
         self.current_request_type = None  # 'check' or 'download'
         self.download_popup_factory = download_popup_factory
         self.download_progress_popup = None
+        self._check_in_progress = False
 
     @staticmethod
     def _apply_redirect_policy(request: QNetworkRequest) -> None:
@@ -69,8 +70,18 @@ class UpdateChecker:
         Args:
             silent: If True, only show notification if update is available
         """
+        if self._check_in_progress:
+            if not silent:
+                self.parent.show_notification(
+                    "Update check already in progress...",
+                    duration=2000,
+                    notification_type="info",
+                )
+            return
+
         self.silent = silent
         self.current_request_type = 'check'
+        self._check_in_progress = True
 
         # First, get the latest commit info to check version
         request = QNetworkRequest(QUrl(__github_api_commits_url__))
@@ -87,6 +98,8 @@ class UpdateChecker:
                     duration=4000,
                     notification_type="error"
                 )
+            if self.current_request_type in {'check', 'version_check'}:
+                self._check_in_progress = False
             reply.deleteLater()
             return
 
@@ -139,6 +152,7 @@ class UpdateChecker:
                         duration=3000,
                         notification_type="success"
                     )
+                self._check_in_progress = False
 
             elif self.current_request_type == 'download':
                 # Download completed - install the update
@@ -152,6 +166,8 @@ class UpdateChecker:
                     duration=4000,
                     notification_type="error"
                 )
+            if self.current_request_type in {'check', 'version_check'}:
+                self._check_in_progress = False
         finally:
             reply.deleteLater()
 
