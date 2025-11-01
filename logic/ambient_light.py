@@ -75,8 +75,9 @@ class AmbientLightMonitor(QThread):
             elif self._is_raspberry_pi:
                 if self._verbose:
                     print("[AutoBrightness] Raspberry Pi detected", file=sys.stderr, flush=True)
-                # Для Raspberry Pi пробуем V4L2 и GSTREAMER
-                backends = [cv2.CAP_V4L2, cv2.CAP_GSTREAMER, cv2.CAP_ANY]
+                # Для Raspberry Pi пробуем только V4L2 с индексами
+                # GStreamer требует pipeline, а не индекс, поэтому пробуем его отдельно
+                backends = [cv2.CAP_V4L2, cv2.CAP_ANY]
             else:
                 backends = [cv2.CAP_V4L2, cv2.CAP_ANY]
             
@@ -91,8 +92,11 @@ class AmbientLightMonitor(QThread):
                     print(f"[AutoBrightness] Camera opened successfully with {backend_name}", file=sys.stderr, flush=True)
                     break
 
-        # Raspberry Pi specific fallback: attempt libcamera/rpicamsrc pipelines
+        # Raspberry Pi specific fallback: attempt GStreamer pipelines (v4l2src/libcamerasrc)
+        # This is the primary method for RPi 5 cameras
         if not self._capture and self._is_raspberry_pi:
+            if self._verbose:
+                print("[AutoBrightness] Trying Raspberry Pi GStreamer pipelines...", file=sys.stderr, flush=True)
             self._capture = self._open_raspberry_pi_camera()
         
         if not self._capture:
@@ -274,6 +278,19 @@ class AmbientLightMonitor(QThread):
         env_pipeline = os.environ.get("NDOT_AUTO_BRIGHTNESS_CAMERA_PIPELINE", "").strip()
         if env_pipeline:
             pipelines.append(("env", env_pipeline))
+
+        # Try v4l2src with common video devices (works on RPi 5 with CSI cameras)
+        # Probe video0-7 as these are typically CSI camera interfaces
+        for idx in range(8):
+            device = f"/dev/video{idx}"
+            if os.path.exists(device):
+                pipelines.append(
+                    (
+                        f"v4l2src-{idx}",
+                        f"v4l2src device={device} ! video/x-raw,width=640,height=480 "
+                        f"! videoconvert ! video/x-raw,format=BGR ! appsink drop=true",
+                    )
+                )
 
         # Default libcamera pipeline suitable for modern Raspberry Pi OS images.
         pipelines.append(
