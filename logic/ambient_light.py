@@ -74,7 +74,6 @@ def _ensure_picamera2():
         # Добавляем защиту от segmentation fault через subprocess
         # Проверяем доступность picamera2 перед импортом
         import subprocess
-        import sys
         
         try:
             # Проверяем, может ли Python вообще импортировать picamera2 без segfault
@@ -114,7 +113,6 @@ def _ensure_picamera2():
         try:
             # Повторяем тест после установки stub
             import subprocess
-            import sys
             
             try:
                 result = subprocess.run([
@@ -251,7 +249,6 @@ class AmbientLightMonitor(QThread):
             # Безопасная проверка picamera2 через subprocess
             try:
                 import subprocess
-                import sys
                 
                 result = subprocess.run([
                     sys.executable, '-c', 
@@ -323,7 +320,6 @@ class AmbientLightMonitor(QThread):
             # Дополнительная проверка перед попыткой picamera2
             try:
                 import subprocess
-                import sys
                 
                 result = subprocess.run([
                     sys.executable, '-c', 
