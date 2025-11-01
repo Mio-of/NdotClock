@@ -18,10 +18,12 @@ try:
 except ImportError:  # pragma: no cover - handled at runtime
     cv2 = None  # type: ignore
 
+_PICAMERA2_IMPORT_ERROR: Optional[BaseException] = None
 try:
     from picamera2 import Picamera2  # type: ignore
-except ImportError:  # pragma: no cover - optional dependency on Raspberry Pi
+except Exception as exc:  # pragma: no cover - optional dependency on Raspberry Pi
     Picamera2 = None  # type: ignore
+    _PICAMERA2_IMPORT_ERROR = exc
 
 
 class _Picamera2Adapter:
@@ -349,7 +351,15 @@ class AmbientLightMonitor(QThread):
         """Fallback to Picamera2 when OpenCV backends are unavailable on Raspberry Pi."""
         if Picamera2 is None:
             if self._verbose:
-                print("[AutoBrightness] Picamera2 module not available; skipping fallback", file=sys.stderr, flush=True)
+                if _PICAMERA2_IMPORT_ERROR is not None:
+                    print(
+                        "[AutoBrightness] Picamera2 import failed, skipping fallback: "
+                        f"{_PICAMERA2_IMPORT_ERROR}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                else:
+                    print("[AutoBrightness] Picamera2 module not available; skipping fallback", file=sys.stderr, flush=True)
             return None
         try:
             adapter = _Picamera2Adapter()
