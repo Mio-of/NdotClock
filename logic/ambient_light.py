@@ -6,6 +6,8 @@ import os
 import sys
 from typing import List, Optional, Tuple
 
+import types
+
 from PyQt6.QtCore import QThread, pyqtSignal
 
 try:
@@ -19,21 +21,71 @@ except ImportError:  # pragma: no cover - handled at runtime
     cv2 = None  # type: ignore
 
 _PICAMERA2_IMPORT_ERROR: Optional[BaseException] = None
-try:
-    from picamera2 import Picamera2  # type: ignore
-except Exception as exc:  # pragma: no cover - optional dependency on Raspberry Pi
-    Picamera2 = None  # type: ignore
-    _PICAMERA2_IMPORT_ERROR = exc
+_PICAMERA2_CLASS = None
+
+
+def _install_simplejpeg_stub(exc: BaseException) -> None:
+    """Provide a minimal stub for simplejpeg when native wheels mismatch NumPy."""
+    if "simplejpeg" in sys.modules:
+        return
+    module = types.ModuleType("simplejpeg")
+    message = f"simplejpeg unavailable ({exc})"
+
+    def _unsupported(*_args, **_kwargs):
+        raise RuntimeError(message)
+
+    module.encode_jpeg = _unsupported  # type: ignore[attr-defined]
+    module.encode_jpeg_yuv_planes = _unsupported  # type: ignore[attr-defined]
+    module.decode_jpeg = _unsupported  # type: ignore[attr-defined]
+    module.decode_jpeg_yuv420 = _unsupported  # type: ignore[attr-defined]
+    module.__all__ = [
+        "encode_jpeg",
+        "encode_jpeg_yuv_planes",
+        "decode_jpeg",
+        "decode_jpeg_yuv420",
+    ]
+    sys.modules["simplejpeg"] = module
+
+
+def _ensure_picamera2():
+    """Attempt to import Picamera2 lazily with graceful failure handling."""
+    global _PICAMERA2_CLASS, _PICAMERA2_IMPORT_ERROR
+    if _PICAMERA2_CLASS is not None:
+        return _PICAMERA2_CLASS
+    if _PICAMERA2_IMPORT_ERROR is not None:
+        return None
+
+    try:
+        from picamera2 import Picamera2 as _Picamera2  # type: ignore
+
+        _PICAMERA2_CLASS = _Picamera2
+        _PICAMERA2_IMPORT_ERROR = None
+        return _PICAMERA2_CLASS
+    except Exception as exc:  # pragma: no cover - optional dependency on Raspberry Pi
+        if "simplejpeg" in str(exc).lower():
+            _install_simplejpeg_stub(exc)
+            try:
+                from picamera2 import Picamera2 as _Picamera2  # type: ignore
+
+                _PICAMERA2_CLASS = _Picamera2
+                _PICAMERA2_IMPORT_ERROR = None
+                return _PICAMERA2_CLASS
+            except Exception as retry_exc:  # pragma: no cover - optional dependency
+                _PICAMERA2_IMPORT_ERROR = retry_exc
+                return None
+        _PICAMERA2_IMPORT_ERROR = exc
+        return None
 
 
 class _Picamera2Adapter:
     """Minimal adapter to provide a cv2-like interface for Picamera2."""
 
     def __init__(self, resolution: Tuple[int, int] = (640, 480)) -> None:
-        if Picamera2 is None:
+        picam_class = _ensure_picamera2()
+        if picam_class is None:
             raise RuntimeError("Picamera2 not available")
 
-        self._picam = Picamera2()
+        self._picam = picam_class()
         # Prefer a lightweight preview configuration for quick luminance sampling
         config = self._picam.create_preview_configuration(
             main={"size": resolution, "format": "RGB888"}
@@ -113,7 +165,8 @@ class AmbientLightMonitor(QThread):
     def run(self) -> None:
         if self._verbose:
             print("[AutoBrightness] Starting ambient light monitor thread", file=sys.stderr, flush=True)
-        if np is None or (cv2 is None and Picamera2 is None):
+        picamera_available = _ensure_picamera2()
+        if np is None or (cv2 is None and picamera_available is None):
             print("[AutoBrightness] ERROR: No supported camera backend available (need OpenCV or Picamera2 with NumPy)", file=sys.stderr, flush=True)
             self.errorOccurred.emit("missing_backend")
             return
@@ -349,7 +402,8 @@ class AmbientLightMonitor(QThread):
 
     def _open_picamera2(self):
         """Fallback to Picamera2 when OpenCV backends are unavailable on Raspberry Pi."""
-        if Picamera2 is None:
+        picam_class = _ensure_picamera2()
+        if picam_class is None:
             if self._verbose:
                 if _PICAMERA2_IMPORT_ERROR is not None:
                     print(
@@ -477,4 +531,4 @@ class AmbientLightMonitor(QThread):
     @classmethod
     def dependencies_available(cls) -> bool:
         """True if the required external libraries are importable."""
-        return np is not None and (cv2 is not None or Picamera2 is not None)
+        return np is not None and (cv2 is not None or _ensure_picamera2() is not None)
