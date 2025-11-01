@@ -133,11 +133,20 @@ class AmbientLightMonitor(QThread):
     def run(self) -> None:
         if self._verbose:
             print("[AutoBrightness] Starting ambient light monitor thread", file=sys.stderr, flush=True)
-        picamera_available = _ensure_picamera2()
-        if np is None or (cv2 is None and picamera_available is None):
-            print("[AutoBrightness] ERROR: No supported camera backend available (need OpenCV or Picamera2 with NumPy)", file=sys.stderr, flush=True)
+        if np is None:
+            print("[AutoBrightness] ERROR: NumPy not available", file=sys.stderr, flush=True)
             self.errorOccurred.emit("missing_backend")
             return
+
+        if cv2 is None:
+            if not self._enable_picamera2:
+                print("[AutoBrightness] ERROR: OpenCV not available and Picamera2 fallback disabled", file=sys.stderr, flush=True)
+                self.errorOccurred.emit("missing_backend")
+                return
+            if _ensure_picamera2() is None:
+                print("[AutoBrightness] ERROR: Picamera2 backend not available", file=sys.stderr, flush=True)
+                self.errorOccurred.emit("missing_backend")
+                return
 
         # Honour an explicit override before attempting any automatic probing.
         self._capture = self._open_camera_override()
