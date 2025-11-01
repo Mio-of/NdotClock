@@ -163,8 +163,8 @@ class NDotClockSlider(QWidget):
             'location': {'lat': None, 'lon': None},
             'auto_brightness_enabled': False,
             'auto_brightness_camera': 0,
-            'auto_brightness_interval_ms': 2500,  # Увеличено с 1500 до 2500 для более стабильной работы
-            'auto_brightness_min': 0.25,
+            'auto_brightness_interval_ms': 1000,  # Быстрее обновления по умолчанию
+            'auto_brightness_min': 0.0,
             'auto_brightness_max': 1.0,
         }
 
@@ -180,10 +180,10 @@ class NDotClockSlider(QWidget):
         self._suppress_auto_brightness_save = False
         # Улучшенное сглаживание: буфер последних измерений для усреднения
         self._ambient_brightness_buffer = []
-        self._ambient_brightness_buffer_size = 2  # Усредняем последние 2 измерения (минимум для быстрой реакции)
+        self._ambient_brightness_buffer_size = 3  # Короткий буфер для удаления выбросов без потери реакции
         # Минимальная защита от слишком частых обновлений
         self._last_brightness_update_time = 0
-        self._min_brightness_update_interval = 0.1  # Минимум 100ms (анимация Безье обеспечивает плавность)
+        self._min_brightness_update_interval = 0.05  # Минимум 50ms, может быть переопределено через переменную среды
         # Анимация яркости с кривой Безье
         self._brightness_animation_target = self._manual_brightness
         self._brightness_animation = None  # Будет создана позже после инициализации виджета
@@ -224,6 +224,121 @@ class NDotClockSlider(QWidget):
                 file=sys.stderr,
                 flush=True,
             )
+        interval_env = os.environ.get("NDOT_AUTO_BRIGHTNESS_INTERVAL_MS", "").strip()
+        self._auto_brightness_interval_override: Optional[int] = None
+        if interval_env:
+            try:
+                parsed_interval = int(float(interval_env))
+                parsed_interval = max(150, min(parsed_interval, 60000))
+                self._auto_brightness_interval_override = parsed_interval
+                if self._auto_brightness_verbose:
+                    print(
+                        f"[AutoBrightness] NDOT_AUTO_BRIGHTNESS_INTERVAL_MS={parsed_interval}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            except ValueError:
+                if self._auto_brightness_verbose:
+                    print(
+                        f"[AutoBrightness] Invalid NDOT_AUTO_BRIGHTNESS_INTERVAL_MS='{interval_env}', ignoring",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+        self._auto_brightness_smoothing = 0.35
+        smoothing_env = os.environ.get("NDOT_AUTO_BRIGHTNESS_SMOOTHING", "").strip()
+        if smoothing_env:
+            try:
+                parsed_smoothing = float(smoothing_env)
+                self._auto_brightness_smoothing = max(0.0, min(parsed_smoothing, 0.95))
+                if self._auto_brightness_verbose:
+                    print(
+                        f"[AutoBrightness] NDOT_AUTO_BRIGHTNESS_SMOOTHING={self._auto_brightness_smoothing:.3f}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            except ValueError:
+                if self._auto_brightness_verbose:
+                    print(
+                        f"[AutoBrightness] Invalid NDOT_AUTO_BRIGHTNESS_SMOOTHING='{smoothing_env}', ignoring",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+        min_interval_env = os.environ.get("NDOT_AUTO_BRIGHTNESS_MIN_INTERVAL", "").strip()
+        if min_interval_env:
+            try:
+                parsed_min_interval = float(min_interval_env)
+                self._min_brightness_update_interval = max(0.02, min(parsed_min_interval, 1.0))
+                if self._auto_brightness_verbose:
+                    print(
+                        f"[AutoBrightness] NDOT_AUTO_BRIGHTNESS_MIN_INTERVAL={self._min_brightness_update_interval:.3f}s",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            except ValueError:
+                if self._auto_brightness_verbose:
+                    print(
+                        f"[AutoBrightness] Invalid NDOT_AUTO_BRIGHTNESS_MIN_INTERVAL='{min_interval_env}', ignoring",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+        self._auto_brightness_min_override: Optional[float] = None
+        self._auto_brightness_max_override: Optional[float] = None
+        min_env = os.environ.get("NDOT_AUTO_BRIGHTNESS_MIN", "").strip()
+        max_env = os.environ.get("NDOT_AUTO_BRIGHTNESS_MAX", "").strip()
+        if min_env:
+            try:
+                parsed_min = float(min_env)
+                self._auto_brightness_min_override = max(0.0, min(parsed_min, 1.0))
+            except ValueError:
+                if self._auto_brightness_verbose:
+                    print(
+                        f"[AutoBrightness] Invalid NDOT_AUTO_BRIGHTNESS_MIN='{min_env}', ignoring",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+        if max_env:
+            try:
+                parsed_max = float(max_env)
+                self._auto_brightness_max_override = max(0.0, min(parsed_max, 1.0))
+            except ValueError:
+                if self._auto_brightness_verbose:
+                    print(
+                        f"[AutoBrightness] Invalid NDOT_AUTO_BRIGHTNESS_MAX='{max_env}', ignoring",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+        if (
+            self._auto_brightness_min_override is not None
+            and self._auto_brightness_max_override is not None
+            and self._auto_brightness_min_override > self._auto_brightness_max_override
+        ):
+            if self._auto_brightness_verbose:
+                print(
+                    "[AutoBrightness] MIN override is greater than MAX override, swapping them",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            self._auto_brightness_min_override, self._auto_brightness_max_override = (
+                self._auto_brightness_max_override,
+                self._auto_brightness_min_override,
+            )
+        calibration_decay_env = os.environ.get("NDOT_AUTO_BRIGHTNESS_CALIBRATION_DECAY", "").strip()
+        self._ambient_calibration_decay = 0.02
+        if calibration_decay_env:
+            try:
+                parsed_decay = float(calibration_decay_env)
+                self._ambient_calibration_decay = max(0.001, min(parsed_decay, 0.2))
+            except ValueError:
+                if self._auto_brightness_verbose:
+                    print(
+                        f"[AutoBrightness] Invalid NDOT_AUTO_BRIGHTNESS_CALIBRATION_DECAY='{calibration_decay_env}', ignoring",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+        self._ambient_dynamic_min: Optional[float] = None
+        self._ambient_dynamic_max: Optional[float] = None
+        self._ambient_calibration_last_log: Optional[Tuple[float, float]] = None
+        self._auto_brightness_has_sample = False
         self._initialize_system_backlight()
 
         self.setWindowTitle("Ndot Clock")
@@ -4667,6 +4782,40 @@ class NDotClockSlider(QWidget):
             self._auto_brightness_camera_index = self.default_settings['auto_brightness_camera']
             self._pending_auto_brightness_activation = False
 
+        self._apply_auto_brightness_env_overrides()
+
+    def _apply_auto_brightness_env_overrides(self) -> None:
+        """Apply runtime overrides from environment variables."""
+        if (
+            self._auto_brightness_interval_override is None
+            and int(self._auto_brightness_interval_ms) == 2500
+        ):
+            self._auto_brightness_interval_ms = self.default_settings['auto_brightness_interval_ms']
+        if self._auto_brightness_interval_override is not None:
+            self._auto_brightness_interval_ms = self._auto_brightness_interval_override
+        self._auto_brightness_interval_ms = max(150, int(self._auto_brightness_interval_ms))
+
+        if (
+            self._auto_brightness_min_override is None
+            and math.isclose(self._auto_brightness_min, 0.25, abs_tol=1e-3)
+        ):
+            self._auto_brightness_min = self.default_settings['auto_brightness_min']
+        if self._auto_brightness_min_override is not None:
+            self._auto_brightness_min = self._auto_brightness_min_override
+        if self._auto_brightness_max_override is not None:
+            self._auto_brightness_max = max(self._auto_brightness_min, self._auto_brightness_max_override)
+
+        if self._auto_brightness_verbose:
+            print(
+                "[AutoBrightness] Effective settings: "
+                f"interval={self._auto_brightness_interval_ms}ms, "
+                f"range=({self._auto_brightness_min:.3f}..{self._auto_brightness_max:.3f}), "
+                f"smoothing={self._auto_brightness_smoothing:.3f}, "
+                f"calibration_decay={self._ambient_calibration_decay:.4f}",
+                file=sys.stderr,
+                flush=True,
+            )
+
     def _sync_brightness_slider(self):
         """Update slider position without triggering signals."""
         if self.brightness_slider is not None:
@@ -4757,6 +4906,11 @@ class NDotClockSlider(QWidget):
             self._apply_brightness_direct(clamped)
             self._sync_brightness_slider()
             return
+
+        if self._auto_brightness_enabled and self._system_backlight:
+            # При управлении аппаратной подсветкой нет смысла запускать UI-анимацию
+            self._apply_brightness_direct(clamped)
+            return
         
         # Для автояркости - с анимацией по кривой Безье
         if not self._brightness_animation:
@@ -4777,11 +4931,11 @@ class NDotClockSlider(QWidget):
         
         # Адаптивная длительность: быстрее для больших изменений
         if diff > 0.2:
-            duration = 600  # Быстро для больших изменений
+            duration = 450  # Быстрее для больших изменений
         elif diff > 0.1:
-            duration = 800  # Средне
+            duration = 600  # Средне
         else:
-            duration = 1000  # Плавно для малых изменений
+            duration = 750  # Плавно для малых изменений
         
         if self._system_backlight_verbose:
             print(f"[Backlight] Starting animation: {current_brightness:.3f} -> {clamped:.3f} (diff={diff:.3f}, duration={duration}ms)", file=sys.stderr, flush=True)
@@ -4879,12 +5033,63 @@ class NDotClockSlider(QWidget):
     def _map_ambient_to_user_brightness(self, ambient: float) -> float:
         """Map ambient 0..1 value to user brightness range."""
         ambient = max(0.0, min(1.0, ambient))
-        normalized = ambient ** self._auto_brightness_curve_gamma
-        # Подталкиваем яркие значения к верхней границе без резкого скачка
-        if ambient > 0.85:
-            boost = min(1.0, (ambient - 0.85) / 0.15)
-            normalized += (1.0 - normalized) * boost
+        if self._ambient_dynamic_min is None or self._ambient_dynamic_max is None:
+            baseline_min = max(0.0, ambient - 0.05)
+            baseline_max = min(1.0, ambient + 0.10)
+            self._ambient_dynamic_min = baseline_min
+            self._ambient_dynamic_max = baseline_max
+            if self._auto_brightness_verbose:
+                print(
+                    f"[AutoBrightness] Calibration initialized: min={self._ambient_dynamic_min:.3f}, max={self._ambient_dynamic_max:.3f}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        else:
+            if ambient < self._ambient_dynamic_min:
+                self._ambient_dynamic_min = ambient
+            else:
+                self._ambient_dynamic_min += (ambient - self._ambient_dynamic_min) * self._ambient_calibration_decay
+
+            if ambient > self._ambient_dynamic_max:
+                self._ambient_dynamic_max = ambient
+            else:
+                self._ambient_dynamic_max += (ambient - self._ambient_dynamic_max) * self._ambient_calibration_decay
+
+        if self._ambient_dynamic_min is None or self._ambient_dynamic_max is None:
+            dynamic_min = 0.0
+            dynamic_max = 1.0
+        else:
+            if self._ambient_dynamic_max - self._ambient_dynamic_min < 0.05:
+                midpoint = (self._ambient_dynamic_min + self._ambient_dynamic_max) / 2.0
+                self._ambient_dynamic_min = max(0.0, midpoint - 0.025)
+                self._ambient_dynamic_max = min(1.0, midpoint + 0.025)
+            dynamic_min = self._ambient_dynamic_min
+            dynamic_max = self._ambient_dynamic_max
+
+        expanded_min = max(0.0, dynamic_min - 0.05)
+        expanded_max = min(1.0, dynamic_max + 0.10)
+        span = max(0.1, expanded_max - expanded_min)
+        normalized_linear = (ambient - expanded_min) / span
+        normalized_linear = max(0.0, min(1.0, normalized_linear))
+        normalized = normalized_linear ** self._auto_brightness_curve_gamma
+        if normalized_linear > 0.9:
+            boost = min(1.0, (normalized_linear - 0.9) / 0.1)
+            normalized += (1.0 - normalized) * 0.5 * boost
         normalized = max(0.0, min(1.0, normalized))
+
+        if self._auto_brightness_verbose:
+            if (
+                self._ambient_calibration_last_log is None
+                or abs(dynamic_min - self._ambient_calibration_last_log[0]) > 0.02
+                or abs(dynamic_max - self._ambient_calibration_last_log[1]) > 0.02
+            ):
+                print(
+                    f"[AutoBrightness] Calibration range -> min={dynamic_min:.3f}, max={dynamic_max:.3f}, expanded=({expanded_min:.3f}-{expanded_max:.3f})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                self._ambient_calibration_last_log = (dynamic_min, dynamic_max)
+
         return self._auto_brightness_min + (self._auto_brightness_max - self._auto_brightness_min) * normalized
 
     def _on_ambient_brightness_measured(self, ambient: float):
@@ -4920,10 +5125,14 @@ class NDotClockSlider(QWidget):
         
         # Упрощённое сглаживание - анимация Безье обеспечит плавность
         # Лёгкое сглаживание только для устранения шума
-        smoothing = 0.6  # Лёгкое сглаживание
-        self._auto_brightness_smoothed = (
-            self._auto_brightness_smoothed * smoothing + target * (1.0 - smoothing)
-        )
+        if not self._auto_brightness_has_sample:
+            self._auto_brightness_has_sample = True
+            self._auto_brightness_smoothed = target
+        else:
+            smoothing = self._auto_brightness_smoothing
+            self._auto_brightness_smoothed = (
+                self._auto_brightness_smoothed * smoothing + target * (1.0 - smoothing)
+            )
         
         if self._auto_brightness_verbose:
             print(f"[AutoBrightness] Smoothed: {self._auto_brightness_smoothed:.3f}", file=sys.stderr, flush=True)
@@ -4997,6 +5206,7 @@ class NDotClockSlider(QWidget):
             return
 
         self._pending_auto_brightness_activation = False
+        self._auto_brightness_has_sample = False
         deps_available = AmbientLightMonitor.dependencies_available()
         if enabled and not deps_available:
             self._auto_brightness_enabled = False
@@ -5010,6 +5220,9 @@ class NDotClockSlider(QWidget):
         self._auto_brightness_smoothed = self._user_brightness
 
         if enabled:
+            self._apply_auto_brightness_env_overrides()
+            self._ambient_dynamic_min = None
+            self._ambient_dynamic_max = None
             # При включении автояркости пробуем найти системную подсветку,
             # если она еще не инициализирована
             if not self._system_backlight:
