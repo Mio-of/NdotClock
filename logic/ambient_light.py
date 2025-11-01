@@ -58,6 +58,25 @@ def _ensure_picamera2():
         return None
 
     try:
+        # Добавляем защиту от segmentation fault через subprocess
+        # Проверяем доступность picamera2 перед импортом
+        import subprocess
+        import sys
+        
+        try:
+            # Проверяем, может ли Python вообще импортировать picamera2 без segfault
+            result = subprocess.run([
+                sys.executable, '-c', 
+                'import picamera2; print("OK")'
+            ], capture_output=True, text=True, timeout=5)
+            
+            if result.returncode != 0 or "OK" not in result.stdout:
+                raise ImportError(f"picamera2 test failed: {result.stderr}")
+                
+        except (subprocess.TimeoutExpired, subprocess.SubprocessError, FileNotFoundError):
+            raise ImportError("picamera2 subprocess test failed")
+        
+        # Если тест прошел, пробуем импортировать
         from picamera2 import Picamera2 as _Picamera2  # type: ignore
 
         _PICAMERA2_CLASS = _Picamera2
@@ -67,6 +86,22 @@ def _ensure_picamera2():
         # Attempt to stub simplejpeg (common failure on Raspberry Pi 5 with mismatched NumPy wheels)
         _install_simplejpeg_stub(exc)
         try:
+            # Повторяем тест после установки stub
+            import subprocess
+            import sys
+            
+            try:
+                result = subprocess.run([
+                    sys.executable, '-c', 
+                    'import picamera2; print("OK")'
+                ], capture_output=True, text=True, timeout=5)
+                
+                if result.returncode != 0 or "OK" not in result.stdout:
+                    raise ImportError(f"picamera2 test failed after stub: {result.stderr}")
+                    
+            except (subprocess.TimeoutExpired, subprocess.SubprocessError, FileNotFoundError):
+                raise ImportError("picamera2 subprocess test failed after stub")
+            
             from picamera2 import Picamera2 as _Picamera2  # type: ignore
 
             _PICAMERA2_CLASS = _Picamera2
@@ -151,6 +186,8 @@ class AmbientLightMonitor(QThread):
         self._camera_override = env_override or None
         # Enable verbose logging for debugging camera issues
         self._verbose = os.environ.get("NDOT_AUTO_BRIGHTNESS_VERBOSE", "").lower() in ("1", "true", "yes")
+        # Picamera2 fallback enabled by default on Raspberry Pi
+        self._enable_picamera2 = self._is_raspberry_pi
     
     @staticmethod
     def _detect_raspberry_pi() -> bool:
@@ -170,11 +207,33 @@ class AmbientLightMonitor(QThread):
             self.errorOccurred.emit("missing_backend")
             return
 
+        # Проверяем доступность picamera2 перед использованием
         if cv2 is None:
             if not self._enable_picamera2:
                 print("[AutoBrightness] ERROR: OpenCV not available and Picamera2 fallback disabled", file=sys.stderr, flush=True)
                 self.errorOccurred.emit("missing_backend")
                 return
+            
+            # Безопасная проверка picamera2 через subprocess
+            try:
+                import subprocess
+                import sys
+                
+                result = subprocess.run([
+                    sys.executable, '-c', 
+                    'import picamera2; print("OK")'
+                ], capture_output=True, text=True, timeout=3)
+                
+                if result.returncode != 0 or "OK" not in result.stdout:
+                    print(f"[AutoBrightness] ERROR: Picamera2 test failed: {result.stderr}", file=sys.stderr, flush=True)
+                    self.errorOccurred.emit("missing_backend")
+                    return
+                    
+            except (subprocess.TimeoutExpired, subprocess.SubprocessError, FileNotFoundError, Exception) as e:
+                print(f"[AutoBrightness] ERROR: Picamera2 subprocess test failed: {e}", file=sys.stderr, flush=True)
+                self.errorOccurred.emit("missing_backend")
+                return
+            
             if _ensure_picamera2() is None:
                 print("[AutoBrightness] ERROR: Picamera2 backend not available", file=sys.stderr, flush=True)
                 self.errorOccurred.emit("missing_backend")
@@ -221,10 +280,26 @@ class AmbientLightMonitor(QThread):
 
         # Final Raspberry Pi fallback: Picamera2 native capture (libcamera-based)
         if not self._capture and self._is_raspberry_pi:
-            self._capture = self._open_picamera2()
-            if self._capture:
-                self._using_picamera2 = True
-                print("[AutoBrightness] Camera opened via Picamera2 fallback", file=sys.stderr, flush=True)
+            # Дополнительная проверка перед попыткой picamera2
+            try:
+                import subprocess
+                import sys
+                
+                result = subprocess.run([
+                    sys.executable, '-c', 
+                    'import picamera2; print("OK")'
+                ], capture_output=True, text=True, timeout=3)
+                
+                if result.returncode == 0 and "OK" in result.stdout:
+                    self._capture = self._open_picamera2()
+                    if self._capture:
+                        self._using_picamera2 = True
+                        print("[AutoBrightness] Camera opened via Picamera2 fallback", file=sys.stderr, flush=True)
+                else:
+                    print(f"[AutoBrightness] Skipping Picamera2 due to test failure: {result.stderr}", file=sys.stderr, flush=True)
+                    
+            except (subprocess.TimeoutExpired, subprocess.SubprocessError, FileNotFoundError, Exception) as e:
+                print(f"[AutoBrightness] Skipping Picamera2 due to subprocess error: {e}", file=sys.stderr, flush=True)
 
         if not self._capture:
             print("[AutoBrightness] ERROR: Failed to open camera with any backend", file=sys.stderr, flush=True)
