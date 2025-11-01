@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import sys
-import types
 from typing import List, Optional, Tuple
 
 from PyQt6.QtCore import QThread, pyqtSignal
@@ -21,32 +20,6 @@ except ImportError:  # pragma: no cover - handled at runtime
 
 _PICAMERA2_IMPORT_ERROR: Optional[BaseException] = None
 _PICAMERA2_CLASS = None
-_SIMPLEJPEG_STUB_MESSAGE: Optional[str] = None
-
-
-def _install_simplejpeg_stub(exc: BaseException) -> None:
-    """Provide a minimal stub for simplejpeg when native wheels mismatch NumPy."""
-    if "simplejpeg" in sys.modules:
-        return
-    module = types.ModuleType("simplejpeg")
-    message = f"simplejpeg unavailable ({exc})"
-    global _SIMPLEJPEG_STUB_MESSAGE
-    _SIMPLEJPEG_STUB_MESSAGE = message
-
-    def _unsupported(*_args, **_kwargs):
-        raise RuntimeError(message)
-
-    module.encode_jpeg = _unsupported  # type: ignore[attr-defined]
-    module.encode_jpeg_yuv_planes = _unsupported  # type: ignore[attr-defined]
-    module.decode_jpeg = _unsupported  # type: ignore[attr-defined]
-    module.decode_jpeg_yuv420 = _unsupported  # type: ignore[attr-defined]
-    module.__all__ = [
-        "encode_jpeg",
-        "encode_jpeg_yuv_planes",
-        "decode_jpeg",
-        "decode_jpeg_yuv420",
-    ]
-    sys.modules["simplejpeg"] = module
 
 
 def _ensure_picamera2():
@@ -64,17 +37,8 @@ def _ensure_picamera2():
         _PICAMERA2_IMPORT_ERROR = None
         return _PICAMERA2_CLASS
     except Exception as exc:  # pragma: no cover - optional dependency on Raspberry Pi
-        # Attempt to stub simplejpeg (common failure on Raspberry Pi 5 with mismatched NumPy wheels)
-        _install_simplejpeg_stub(exc)
-        try:
-            from picamera2 import Picamera2 as _Picamera2  # type: ignore
-
-            _PICAMERA2_CLASS = _Picamera2
-            _PICAMERA2_IMPORT_ERROR = None
-            return _PICAMERA2_CLASS
-        except Exception as retry_exc:  # pragma: no cover - optional dependency
-            _PICAMERA2_IMPORT_ERROR = retry_exc
-            return None
+        _PICAMERA2_IMPORT_ERROR = exc
+        return None
 
 
 class _Picamera2Adapter:
@@ -145,6 +109,10 @@ class AmbientLightMonitor(QThread):
         self._capture = None
         self._using_picamera2 = False
         self._is_raspberry_pi = self._detect_raspberry_pi()
+        self._enable_picamera2 = (
+            os.environ.get("NDOT_AUTO_BRIGHTNESS_ENABLE_PICAMERA2", "").lower()
+            in ("1", "true", "yes")
+        )
         # Allow overriding the camera source via environment variable.
         # Useful for forcing a specific index, device path or GStreamer pipeline.
         env_override = os.environ.get("NDOT_AUTO_BRIGHTNESS_CAMERA", "").strip()
@@ -407,6 +375,10 @@ class AmbientLightMonitor(QThread):
 
     def _open_picamera2(self):
         """Fallback to Picamera2 when OpenCV backends are unavailable on Raspberry Pi."""
+        if not self._enable_picamera2:
+            if self._verbose:
+                print("[AutoBrightness] Picamera2 fallback disabled (NDOT_AUTO_BRIGHTNESS_ENABLE_PICAMERA2 not set)", file=sys.stderr, flush=True)
+            return None
         picam_class = _ensure_picamera2()
         if picam_class is None:
             if self._verbose:
@@ -544,4 +516,14 @@ class AmbientLightMonitor(QThread):
     @classmethod
     def dependencies_available(cls) -> bool:
         """True if the required external libraries are importable."""
-        return np is not None and (cv2 is not None or _ensure_picamera2() is not None)
+        if np is None:
+            return False
+        if cv2 is not None:
+            return True
+        enable_picamera = (
+            os.environ.get("NDOT_AUTO_BRIGHTNESS_ENABLE_PICAMERA2", "").lower()
+            in ("1", "true", "yes")
+        )
+        if not enable_picamera:
+            return False
+        return _ensure_picamera2() is not None
