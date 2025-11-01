@@ -69,7 +69,13 @@ from config import (
     WEEKDAYS as WEEKDAYS_MAP,
     __version__,
 )
-from logic import AutostartManager, AmbientLightMonitor, JsonParserThread, UpdateChecker
+from logic import (
+    AutostartManager,
+    AmbientLightMonitor,
+    JsonParserThread,
+    SystemBacklightController,
+    UpdateChecker,
+)
 from ui.animations import AnimatedPanel, AnimatedSlideContainer, SlideType
 from ui.controls import ModernColorButton, ModernSlider
 from ui.popups import ConfirmationPopup, DownloadProgressPopup, NotificationPopup
@@ -185,6 +191,10 @@ class NDotClockSlider(QWidget):
         self.brightness_slider: Optional[ModernSlider] = None
         self.auto_brightness_checkbox: Optional[QCheckBox] = None
         self._edit_mode_entry_slide = 0
+        self._system_backlight: Optional[SystemBacklightController] = None
+        self._system_backlight_error_notified = False
+        self._system_backlight_verbose = os.environ.get("NDOT_SYSTEM_BACKLIGHT_VERBOSE", "").lower() in ("1", "true", "yes")
+        self._initialize_system_backlight()
 
         self.setWindowTitle("Ndot Clock")
         self.resize(800, 480)
@@ -425,6 +435,68 @@ class NDotClockSlider(QWidget):
         self._brightness_animation = QPropertyAnimation(self, b"animatedBrightness")
         self._brightness_animation.setDuration(800)  # 800ms для плавного перехода
         self._brightness_animation.setEasingCurve(QEasingCurve.Type.InOutCubic)  # Плавная кубическая кривая Безье
+
+    def _initialize_system_backlight(self):
+        """Configure optional system backlight controller based on environment variables."""
+        config_value = os.environ.get("NDOT_SYSTEM_BACKLIGHT", "").strip()
+        if not config_value:
+            return
+
+        controller = self._resolve_backlight_controller(config_value)
+        if controller is None:
+            if self._system_backlight_verbose:
+                print(
+                    f"[Backlight] No system backlight matched '{config_value}'. "
+                    "Keep using software brightness.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            if not self._system_backlight_error_notified:
+                self._system_backlight_error_notified = True
+                QTimer.singleShot(
+                    0,
+                    lambda: self.show_notification(
+                        self._tr("system_backlight_not_found"),
+                        duration=5000,
+                        notification_type="warning",
+                    ),
+                )
+            return
+
+        self._system_backlight = controller
+        if self._system_backlight_verbose:
+            print(
+                f"[Backlight] Using system backlight device '{controller.name}' "
+                f"(max={controller.max_brightness})",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    def _resolve_backlight_controller(
+        self, config_value: str
+    ) -> Optional[SystemBacklightController]:
+        """Resolve backlight device from configuration string."""
+        parts = [part.strip() for part in config_value.split(",") if part.strip()]
+        if not parts:
+            parts = ["auto"]
+
+        for part in parts:
+            lowered = part.lower()
+            if lowered in ("auto", "detect", "default"):
+                controller = SystemBacklightController.auto_detect()
+                if controller:
+                    return controller
+                continue
+
+            candidate_dir = part
+            if not os.path.isdir(candidate_dir):
+                candidate_dir = os.path.join("/sys/class/backlight", part)
+            if os.path.isdir(candidate_dir):
+                controller = SystemBacklightController.from_directory(candidate_dir)
+                if controller:
+                    return controller
+
+        return None
     
     @pyqtProperty(float)
     def animatedBrightness(self):
@@ -4551,14 +4623,44 @@ class NDotClockSlider(QWidget):
             self.brightness_slider.setValue(int(self._manual_brightness * 100))
             self.brightness_slider.blockSignals(False)
 
+    def _apply_system_backlight(self, value: float):
+        """Best-effort attempt to sync hardware backlight with requested brightness."""
+        if not self._system_backlight:
+            return
+        try:
+            self._system_backlight.set_level(value)
+        except PermissionError as exc:
+            if not self._system_backlight_error_notified:
+                self._system_backlight_error_notified = True
+                self.show_notification(
+                    self._tr("system_backlight_error_permission"),
+                    duration=5000,
+                    notification_type="warning",
+                )
+            if self._system_backlight_verbose:
+                print(f"[Backlight] Permission denied: {exc}", file=sys.stderr, flush=True)
+        except Exception as exc:
+            if self._system_backlight_verbose:
+                print(f"[Backlight] Disabling system backlight due to error: {exc}", file=sys.stderr, flush=True)
+            self._system_backlight = None
+            if not self._system_backlight_error_notified:
+                self._system_backlight_error_notified = True
+                self.show_notification(
+                    self._tr("system_backlight_error_generic", error=str(exc)),
+                    duration=5000,
+                    notification_type="warning",
+                )
+
     def _apply_brightness_direct(self, value: float):
         """Прямое применение яркости без анимации (используется внутри анимации)"""
         clamped = max(0.0, min(1.0, float(value)))
         if math.isclose(clamped, getattr(self, "_user_brightness", 0.0), rel_tol=1e-3):
+            self._apply_system_backlight(clamped)
             return
         self._user_brightness = clamped
         self._update_cached_colors()
         self.update()
+        self._apply_system_backlight(clamped)
     
     def _apply_brightness(self, value: float, *, from_auto: bool):
         """Apply brightness value with Bezier curve animation for auto-brightness."""

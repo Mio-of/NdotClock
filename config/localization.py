@@ -70,6 +70,9 @@ TRANSLATIONS = {
         "auto_brightness_error_camera": "Unable to open webcam for auto brightness.",
         "auto_brightness_error_capture": "Lost connection to the webcam during auto brightness.",
         "auto_brightness_error_generic": "Auto brightness stopped because of an unexpected error.",
+        "system_backlight_error_permission": "Cannot adjust screen backlight (permission denied). Allow writing to /sys/class/backlight or run Ndot Clock with elevated privileges.",
+        "system_backlight_error_generic": "System backlight error: {error}",
+        "system_backlight_not_found": "System backlight device not found. Continuing with software brightness only.",
     },
     "RU": {
         "window_title": "N-Dot Clock",
@@ -119,6 +122,9 @@ TRANSLATIONS = {
         "auto_brightness_error_camera": "Не удалось получить доступ к веб-камере для автояркости.",
         "auto_brightness_error_capture": "Потеряно соединение с веб-камерой при автояркости.",
         "auto_brightness_error_generic": "Автонастройка яркости остановлена из-за ошибки.",
+        "system_backlight_error_permission": "Нельзя изменить яркость экрана (нет доступа). Разрешите запись в /sys/class/backlight или запустите Ndot Clock с повышенными правами.",
+        "system_backlight_error_generic": "Ошибка системной подсветки: {error}",
+        "system_backlight_not_found": "Устройство системной подсветки не найдено. Используем только программную яркость.",
     },
     "UA": {
         "window_title": "N-Dot Clock",
@@ -168,5 +174,8 @@ TRANSLATIONS = {
         "auto_brightness_error_camera": "Не вдалося отримати доступ до вебкамери для автояскравості.",
         "auto_brightness_error_capture": "Втрачено з'єднання з вебкамерою під час автоналаштування яскравості.",
         "auto_brightness_error_generic": "Автоналаштування яскравості зупинено через помилку.",
+        "system_backlight_error_permission": "Неможливо змінити яскравість екрана (немає доступу). Дозвольте запис у /sys/class/backlight або запустіть Ndot Clock з підвищеними правами.",
+        "system_backlight_error_generic": "Помилка системного підсвічування: {error}",
+        "system_backlight_not_found": "Пристрій системного підсвічування не знайдено. Використовуємо лише програмну яскравість.",
     },
 }
