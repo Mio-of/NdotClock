@@ -1,5 +1,6 @@
-# N-Dot Clock Dependencies
+# N-Dot Clock Dependencies for Raspberry Pi
 # Python 3.8+ required
+# Raspberry Pi OS (Bookworm or later) recommended
 
 # Main GUI Framework
 PyQt6>=6.7.0
@@ -8,10 +9,14 @@ PyQt6-sip>=13.6.0
 # WebEngine for YouTube and Home Assistant integration
 PyQt6-WebEngine>=6.7.0
 
-# Ambient light sensing (optional, for automatic brightness control)
+# Ambient light sensing and camera support
 opencv-python>=4.8.0
-numpy>=1.24.0
+numpy>=1.24.0,<2.0.0  # IMPORTANT: NumPy 2.x breaks simplejpeg compatibility
 
-# Optional: For building standalone executables
-# Uncomment if you want to build with PyInstaller
-# pyinstaller>=6.0.0
+# Raspberry Pi camera support
+# RECOMMENDED: Install via apt instead of pip to avoid compatibility issues
+# sudo apt install python3-picamera2 python3-numpy python3-opencv
+#
+# If you must use pip:
+# picamera2>=0.3.0
+# simplejpeg>=1.6.0
