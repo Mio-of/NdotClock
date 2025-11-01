@@ -44,6 +44,8 @@ class AmbientLightMonitor(QThread):
         # Useful for forcing a specific index, device path or GStreamer pipeline.
         env_override = os.environ.get("NDOT_AUTO_BRIGHTNESS_CAMERA", "").strip()
         self._camera_override = env_override or None
+        # Enable verbose logging for debugging camera issues
+        self._verbose = os.environ.get("NDOT_AUTO_BRIGHTNESS_VERBOSE", "").lower() in ("1", "true", "yes")
     
     @staticmethod
     def _detect_raspberry_pi() -> bool:
@@ -56,7 +58,8 @@ class AmbientLightMonitor(QThread):
             return False
 
     def run(self) -> None:
-        print("[AutoBrightness] Starting ambient light monitor thread", file=sys.stderr, flush=True)
+        if self._verbose:
+            print("[AutoBrightness] Starting ambient light monitor thread", file=sys.stderr, flush=True)
         if cv2 is None or np is None:
             print("[AutoBrightness] ERROR: OpenCV or NumPy not available", file=sys.stderr, flush=True)
             self.errorOccurred.emit("missing_backend")
@@ -70,7 +73,8 @@ class AmbientLightMonitor(QThread):
             if os.name == "nt":
                 backends = [cv2.CAP_DSHOW]
             elif self._is_raspberry_pi:
-                print("[AutoBrightness] Raspberry Pi detected", file=sys.stderr, flush=True)
+                if self._verbose:
+                    print("[AutoBrightness] Raspberry Pi detected", file=sys.stderr, flush=True)
                 # Для Raspberry Pi пробуем V4L2 и GSTREAMER
                 backends = [cv2.CAP_V4L2, cv2.CAP_GSTREAMER, cv2.CAP_ANY]
             else:
@@ -80,7 +84,8 @@ class AmbientLightMonitor(QThread):
             self._capture = None
             for backend in backends:
                 backend_name = self._get_backend_name(backend)
-                print(f"[AutoBrightness] Trying backend: {backend_name} (index: {self._camera_index})", file=sys.stderr, flush=True)
+                if self._verbose:
+                    print(f"[AutoBrightness] Trying backend: {backend_name} (index: {self._camera_index})", file=sys.stderr, flush=True)
                 self._capture = self._open_camera(backend)
                 if self._capture:
                     print(f"[AutoBrightness] Camera opened successfully with {backend_name}", file=sys.stderr, flush=True)
@@ -100,13 +105,14 @@ class AmbientLightMonitor(QThread):
         if not self._is_raspberry_pi:
             self._capture.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
             self._capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
-        else:
+        elif self._verbose:
             # Для RPi используем значения по умолчанию или меньшие
             print("[AutoBrightness] Using default camera resolution for Raspberry Pi", file=sys.stderr, flush=True)
         
         self._running = True
         failed_reads = 0
-        print("[AutoBrightness] Camera opened successfully, starting capture loop", file=sys.stderr, flush=True)
+        if self._verbose:
+            print("[AutoBrightness] Camera opened successfully, starting capture loop", file=sys.stderr, flush=True)
 
         while self._running:
             ret, frame = self._capture.read()
@@ -162,9 +168,11 @@ class AmbientLightMonitor(QThread):
     def _open_camera(self, backend: int):
         """Try to open the preferred camera, falling back to nearby indices."""
         probe_indices = self._build_probe_indices()
-        print(f"[AutoBrightness] Probing camera indices: {probe_indices}", file=sys.stderr, flush=True)
+        if self._verbose:
+            print(f"[AutoBrightness] Probing camera indices: {probe_indices}", file=sys.stderr, flush=True)
         for idx in probe_indices:
-            print(f"[AutoBrightness] Trying camera index {idx}...", file=sys.stderr, flush=True)
+            if self._verbose:
+                print(f"[AutoBrightness] Trying camera index {idx}...", file=sys.stderr, flush=True)
             try:
                 capture = cv2.VideoCapture(idx, backend)
                 if capture and capture.isOpened():
@@ -172,23 +180,30 @@ class AmbientLightMonitor(QThread):
                     if self._is_raspberry_pi:
                         ret, test_frame = capture.read()
                         if not ret or test_frame is None:
-                            print(f"[AutoBrightness] Camera {idx} opened but cannot read frames", file=sys.stderr, flush=True)
+                            if self._verbose:
+                                print(f"[AutoBrightness] Camera {idx} opened but cannot read frames", file=sys.stderr, flush=True)
                             capture.release()
                             continue
-                        print(f"[AutoBrightness] Camera {idx} test read successful", file=sys.stderr, flush=True)
+                        if self._verbose:
+                            print(f"[AutoBrightness] Camera {idx} test read successful", file=sys.stderr, flush=True)
                     
-                    print(f"[AutoBrightness] Camera {idx} opened successfully", file=sys.stderr, flush=True)
+                    if self._verbose:
+                        print(f"[AutoBrightness] Camera {idx} opened successfully", file=sys.stderr, flush=True)
                     if idx != self._camera_index:
                         self._camera_index = idx
-                        print(f"[AutoBrightness] Camera index resolved to {idx}", file=sys.stderr, flush=True)
+                        if self._verbose:
+                            print(f"[AutoBrightness] Camera index resolved to {idx}", file=sys.stderr, flush=True)
                         self.cameraIndexResolved.emit(idx)
                     return capture
                 if capture:
                     capture.release()
-                print(f"[AutoBrightness] Camera {idx} failed to open", file=sys.stderr, flush=True)
+                if self._verbose:
+                    print(f"[AutoBrightness] Camera {idx} failed to open", file=sys.stderr, flush=True)
             except Exception as e:
-                print(f"[AutoBrightness] Exception opening camera {idx}: {e}", file=sys.stderr, flush=True)
-        print("[AutoBrightness] No cameras available", file=sys.stderr, flush=True)
+                if self._verbose:
+                    print(f"[AutoBrightness] Exception opening camera {idx}: {e}", file=sys.stderr, flush=True)
+        if self._verbose:
+            print("[AutoBrightness] No cameras available", file=sys.stderr, flush=True)
         return None
 
     def _open_camera_override(self):
@@ -197,7 +212,8 @@ class AmbientLightMonitor(QThread):
             return None
 
         value = self._camera_override
-        print(f"[AutoBrightness] Using camera override: {value}", file=sys.stderr, flush=True)
+        if self._verbose:
+            print(f"[AutoBrightness] Using camera override: {value}", file=sys.stderr, flush=True)
 
         # Try interpreting override as an integer index first.
         try:
@@ -207,21 +223,24 @@ class AmbientLightMonitor(QThread):
 
         if override_index is not None:
             self._camera_index = max(0, override_index)
-            print(f"[AutoBrightness] Override parsed as camera index {self._camera_index}", file=sys.stderr, flush=True)
+            if self._verbose:
+                print(f"[AutoBrightness] Override parsed as camera index {self._camera_index}", file=sys.stderr, flush=True)
             return None  # fall through to normal probing with new index
 
         # Device path (e.g. /dev/video2)
         if value.startswith("/"):
             backend = cv2.CAP_V4L2 if hasattr(cv2, "CAP_V4L2") else cv2.CAP_ANY
             try:
-                print(f"[AutoBrightness] Trying device path override: {value}", file=sys.stderr, flush=True)
+                if self._verbose:
+                    print(f"[AutoBrightness] Trying device path override: {value}", file=sys.stderr, flush=True)
                 capture = cv2.VideoCapture(value, backend)
                 if capture and capture.isOpened():
                     if self._validate_capture(capture, source=value):
                         return capture
                     capture.release()
             except Exception as exc:
-                print(f"[AutoBrightness] Device path override failed: {exc}", file=sys.stderr, flush=True)
+                if self._verbose:
+                    print(f"[AutoBrightness] Device path override failed: {exc}", file=sys.stderr, flush=True)
             return None
 
         # Allow forcing a raw GStreamer pipeline via override.
@@ -238,7 +257,8 @@ class AmbientLightMonitor(QThread):
         if not pipelines:
             return None
 
-        print(f"[AutoBrightness] Trying Raspberry Pi specific pipelines: {[name for name, _ in pipelines]}", file=sys.stderr, flush=True)
+        if self._verbose:
+            print(f"[AutoBrightness] Trying Raspberry Pi specific pipelines: {[name for name, _ in pipelines]}", file=sys.stderr, flush=True)
         for name, pipeline in pipelines:
             capture = self._open_gstreamer_pipeline(pipeline, source=name)
             if capture:
@@ -284,14 +304,17 @@ class AmbientLightMonitor(QThread):
         """Try to open a camera using a GStreamer pipeline."""
         pipeline = pipeline.strip()
         if not pipeline:
-            print(f"[AutoBrightness] GStreamer pipeline '{source}' is empty, skipping", file=sys.stderr, flush=True)
+            if self._verbose:
+                print(f"[AutoBrightness] GStreamer pipeline '{source}' is empty, skipping", file=sys.stderr, flush=True)
             return None
 
         if not hasattr(cv2, "CAP_GSTREAMER"):
-            print(f"[AutoBrightness] OpenCV built without GStreamer support; cannot use pipeline '{source}'", file=sys.stderr, flush=True)
+            if self._verbose:
+                print(f"[AutoBrightness] OpenCV built without GStreamer support; cannot use pipeline '{source}'", file=sys.stderr, flush=True)
             return None
 
-        print(f"[AutoBrightness] Trying GStreamer pipeline '{source}': {pipeline}", file=sys.stderr, flush=True)
+        if self._verbose:
+            print(f"[AutoBrightness] Trying GStreamer pipeline '{source}': {pipeline}", file=sys.stderr, flush=True)
         try:
             capture = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
             if capture and capture.isOpened():
@@ -301,9 +324,11 @@ class AmbientLightMonitor(QThread):
             else:
                 if capture:
                     capture.release()
-                print(f"[AutoBrightness] Pipeline '{source}' failed to open", file=sys.stderr, flush=True)
+                if self._verbose:
+                    print(f"[AutoBrightness] Pipeline '{source}' failed to open", file=sys.stderr, flush=True)
         except Exception as exc:
-            print(f"[AutoBrightness] Exception while opening pipeline '{source}': {exc}", file=sys.stderr, flush=True)
+            if self._verbose:
+                print(f"[AutoBrightness] Exception while opening pipeline '{source}': {exc}", file=sys.stderr, flush=True)
         return None
 
     def _validate_capture(self, capture, source: str = "") -> bool:
@@ -311,14 +336,17 @@ class AmbientLightMonitor(QThread):
         try:
             ret, test_frame = capture.read()
         except Exception as exc:  # pragma: no cover - defensive
-            print(f"[AutoBrightness] Exception while validating capture '{source}': {exc}", file=sys.stderr, flush=True)
+            if self._verbose:
+                print(f"[AutoBrightness] Exception while validating capture '{source}': {exc}", file=sys.stderr, flush=True)
             return False
 
         if not ret or test_frame is None:
-            print(f"[AutoBrightness] Capture '{source}' opened but produced no frames", file=sys.stderr, flush=True)
+            if self._verbose:
+                print(f"[AutoBrightness] Capture '{source}' opened but produced no frames", file=sys.stderr, flush=True)
             return False
 
-        print(f"[AutoBrightness] Capture '{source}' validation succeeded", file=sys.stderr, flush=True)
+        if self._verbose:
+            print(f"[AutoBrightness] Capture '{source}' validation succeeded", file=sys.stderr, flush=True)
         return True
 
     def _build_probe_indices(self) -> List[int]:
