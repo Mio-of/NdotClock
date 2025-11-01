@@ -4830,9 +4830,9 @@ class NDotClockSlider(QWidget):
 
         if user_triggered and not self._suppress_auto_brightness_save:
             self.save_settings()
-    def _create_download_progress_popup(self):
+    def _create_download_progress_popup(self, parent=None):
         """Factory to create download progress popup with consistent parenting."""
-        return DownloadProgressPopup(self)
+        return DownloadProgressPopup(parent or self)
 
     def show_notification(self, message: str, duration: int = 3000, notification_type: str = "info"):
         """Show internal notification popup"""
