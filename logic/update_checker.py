@@ -62,6 +62,7 @@ class UpdateChecker:
         # First, get the latest commit info to check version
         request = QNetworkRequest(QUrl(__github_api_commits_url__))
         request.setHeader(QNetworkRequest.KnownHeaders.UserAgentHeader, f"NdotClock/{__version__}")
+        request.setAttribute(QNetworkRequest.Attribute.FollowRedirectsAttribute, True)
         self.network_manager.get(request)
 
     def _on_update_check_finished(self, reply: QNetworkReply):
@@ -96,6 +97,7 @@ class UpdateChecker:
                 request = QNetworkRequest(QUrl(__github_version_file_url__))
                 # исправлено: сравниваем версии по актуальному файлу конфигурации на GitHub
                 request.setHeader(QNetworkRequest.KnownHeaders.UserAgentHeader, f"NdotClock/{__version__}")
+                request.setAttribute(QNetworkRequest.Attribute.FollowRedirectsAttribute, True)
                 self.network_manager.get(request)
 
             elif self.current_request_type == 'version_check':
@@ -209,6 +211,7 @@ class UpdateChecker:
         request = QNetworkRequest(QUrl(__github_archive_url__))
         # исправлено: скачиваем zip-архив репозитория вместо одиночного скрипта
         request.setHeader(QNetworkRequest.KnownHeaders.UserAgentHeader, f"NdotClock/{__version__}")
+        request.setAttribute(QNetworkRequest.Attribute.FollowRedirectsAttribute, True)
 
         reply = self.network_manager.get(request)
         reply.downloadProgress.connect(self._on_download_progress)

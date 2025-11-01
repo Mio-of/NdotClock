@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import platform
 import sys
 from typing import List, Optional
 
@@ -41,6 +40,10 @@ class AmbientLightMonitor(QThread):
         self._running = False
         self._capture = None
         self._is_raspberry_pi = self._detect_raspberry_pi()
+        # Allow overriding the camera source via environment variable.
+        # Useful for forcing a specific index, device path or GStreamer pipeline.
+        env_override = os.environ.get("NDOT_AUTO_BRIGHTNESS_CAMERA", "").strip()
+        self._camera_override = env_override or None
     
     @staticmethod
     def _detect_raspberry_pi() -> bool:
@@ -59,25 +62,33 @@ class AmbientLightMonitor(QThread):
             self.errorOccurred.emit("missing_backend")
             return
 
-        # Определяем бэкенд в зависимости от платформы
-        if os.name == "nt":
-            backends = [cv2.CAP_DSHOW]
-        elif self._is_raspberry_pi:
-            print("[AutoBrightness] Raspberry Pi detected", file=sys.stderr, flush=True)
-            # Для Raspberry Pi пробуем V4L2 и GSTREAMER
-            backends = [cv2.CAP_V4L2, cv2.CAP_GSTREAMER, cv2.CAP_ANY]
-        else:
-            backends = [cv2.CAP_V4L2, cv2.CAP_ANY]
-        
-        # Пробуем открыть камеру с разными бэкендами
-        self._capture = None
-        for backend in backends:
-            backend_name = self._get_backend_name(backend)
-            print(f"[AutoBrightness] Trying backend: {backend_name} (index: {self._camera_index})", file=sys.stderr, flush=True)
-            self._capture = self._open_camera(backend)
-            if self._capture:
-                print(f"[AutoBrightness] Camera opened successfully with {backend_name}", file=sys.stderr, flush=True)
-                break
+        # Honour an explicit override before attempting any automatic probing.
+        self._capture = self._open_camera_override()
+
+        if not self._capture:
+            # Определяем бэкенд в зависимости от платформы
+            if os.name == "nt":
+                backends = [cv2.CAP_DSHOW]
+            elif self._is_raspberry_pi:
+                print("[AutoBrightness] Raspberry Pi detected", file=sys.stderr, flush=True)
+                # Для Raspberry Pi пробуем V4L2 и GSTREAMER
+                backends = [cv2.CAP_V4L2, cv2.CAP_GSTREAMER, cv2.CAP_ANY]
+            else:
+                backends = [cv2.CAP_V4L2, cv2.CAP_ANY]
+            
+            # Пробуем открыть камеру с разными бэкендами
+            self._capture = None
+            for backend in backends:
+                backend_name = self._get_backend_name(backend)
+                print(f"[AutoBrightness] Trying backend: {backend_name} (index: {self._camera_index})", file=sys.stderr, flush=True)
+                self._capture = self._open_camera(backend)
+                if self._capture:
+                    print(f"[AutoBrightness] Camera opened successfully with {backend_name}", file=sys.stderr, flush=True)
+                    break
+
+        # Raspberry Pi specific fallback: attempt libcamera/rpicamsrc pipelines
+        if not self._capture and self._is_raspberry_pi:
+            self._capture = self._open_raspberry_pi_camera()
         
         if not self._capture:
             print("[AutoBrightness] ERROR: Failed to open camera with any backend", file=sys.stderr, flush=True)
@@ -179,6 +190,136 @@ class AmbientLightMonitor(QThread):
                 print(f"[AutoBrightness] Exception opening camera {idx}: {e}", file=sys.stderr, flush=True)
         print("[AutoBrightness] No cameras available", file=sys.stderr, flush=True)
         return None
+
+    def _open_camera_override(self):
+        """Attempt to open an explicitly requested camera source."""
+        if not self._camera_override:
+            return None
+
+        value = self._camera_override
+        print(f"[AutoBrightness] Using camera override: {value}", file=sys.stderr, flush=True)
+
+        # Try interpreting override as an integer index first.
+        try:
+            override_index = int(value)
+        except (TypeError, ValueError):
+            override_index = None
+
+        if override_index is not None:
+            self._camera_index = max(0, override_index)
+            print(f"[AutoBrightness] Override parsed as camera index {self._camera_index}", file=sys.stderr, flush=True)
+            return None  # fall through to normal probing with new index
+
+        # Device path (e.g. /dev/video2)
+        if value.startswith("/"):
+            backend = cv2.CAP_V4L2 if hasattr(cv2, "CAP_V4L2") else cv2.CAP_ANY
+            try:
+                print(f"[AutoBrightness] Trying device path override: {value}", file=sys.stderr, flush=True)
+                capture = cv2.VideoCapture(value, backend)
+                if capture and capture.isOpened():
+                    if self._validate_capture(capture, source=value):
+                        return capture
+                    capture.release()
+            except Exception as exc:
+                print(f"[AutoBrightness] Device path override failed: {exc}", file=sys.stderr, flush=True)
+            return None
+
+        # Allow forcing a raw GStreamer pipeline via override.
+        # Optional gstreamer: prefix keeps backward compatibility if plain strings are used.
+        pipeline_value = value
+        prefix = "gstreamer:"
+        if value.startswith(prefix):
+            pipeline_value = value[len(prefix):].strip()
+        return self._open_gstreamer_pipeline(pipeline_value, source="override")
+
+    def _open_raspberry_pi_camera(self):
+        """Probe Raspberry Pi specific backends such as libcamera pipelines."""
+        pipelines = self._build_raspberry_pi_pipelines()
+        if not pipelines:
+            return None
+
+        print(f"[AutoBrightness] Trying Raspberry Pi specific pipelines: {[name for name, _ in pipelines]}", file=sys.stderr, flush=True)
+        for name, pipeline in pipelines:
+            capture = self._open_gstreamer_pipeline(pipeline, source=name)
+            if capture:
+                print(f"[AutoBrightness] Camera opened via Raspberry Pi pipeline '{name}'", file=sys.stderr, flush=True)
+                return capture
+        return None
+
+    def _build_raspberry_pi_pipelines(self) -> List[tuple[str, str]]:
+        """Return a list of candidate GStreamer pipelines for Raspberry Pi cameras."""
+        pipelines: List[tuple[str, str]] = []
+
+        # Explicit environment override has highest priority.
+        env_pipeline = os.environ.get("NDOT_AUTO_BRIGHTNESS_CAMERA_PIPELINE", "").strip()
+        if env_pipeline:
+            pipelines.append(("env", env_pipeline))
+
+        # Default libcamera pipeline suitable for modern Raspberry Pi OS images.
+        pipelines.append(
+            (
+                "libcamerasrc-bgr",
+                "libcamerasrc ! video/x-raw,width=640,height=480,framerate=30/1 "
+                "! videoconvert ! video/x-raw,format=BGR ! appsink drop=true",
+            )
+        )
+        pipelines.append(
+            (
+                "libcamerasrc-rgb",
+                "libcamerasrc ! video/x-raw,width=640,height=480,framerate=30/1 "
+                "! videoconvert ! video/x-raw,format=RGB ! appsink drop=true",
+            )
+        )
+        # Legacy pipeline for older Raspberry Pi distributions with rpicamsrc.
+        pipelines.append(
+            (
+                "rpicamsrc",
+                "rpicamsrc ! video/x-raw,width=640,height=480,framerate=30/1 "
+                "! videoconvert ! video/x-raw,format=BGR ! appsink drop=true",
+            )
+        )
+        return pipelines
+
+    def _open_gstreamer_pipeline(self, pipeline: str, source: str):
+        """Try to open a camera using a GStreamer pipeline."""
+        pipeline = pipeline.strip()
+        if not pipeline:
+            print(f"[AutoBrightness] GStreamer pipeline '{source}' is empty, skipping", file=sys.stderr, flush=True)
+            return None
+
+        if not hasattr(cv2, "CAP_GSTREAMER"):
+            print(f"[AutoBrightness] OpenCV built without GStreamer support; cannot use pipeline '{source}'", file=sys.stderr, flush=True)
+            return None
+
+        print(f"[AutoBrightness] Trying GStreamer pipeline '{source}': {pipeline}", file=sys.stderr, flush=True)
+        try:
+            capture = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+            if capture and capture.isOpened():
+                if self._validate_capture(capture, source=source):
+                    return capture
+                capture.release()
+            else:
+                if capture:
+                    capture.release()
+                print(f"[AutoBrightness] Pipeline '{source}' failed to open", file=sys.stderr, flush=True)
+        except Exception as exc:
+            print(f"[AutoBrightness] Exception while opening pipeline '{source}': {exc}", file=sys.stderr, flush=True)
+        return None
+
+    def _validate_capture(self, capture, source: str = "") -> bool:
+        """Ensure that the capture can deliver frames before using it."""
+        try:
+            ret, test_frame = capture.read()
+        except Exception as exc:  # pragma: no cover - defensive
+            print(f"[AutoBrightness] Exception while validating capture '{source}': {exc}", file=sys.stderr, flush=True)
+            return False
+
+        if not ret or test_frame is None:
+            print(f"[AutoBrightness] Capture '{source}' opened but produced no frames", file=sys.stderr, flush=True)
+            return False
+
+        print(f"[AutoBrightness] Capture '{source}' validation succeeded", file=sys.stderr, flush=True)
+        return True
 
     def _build_probe_indices(self) -> List[int]:
         """Return an ordered list of camera indices to probe."""
