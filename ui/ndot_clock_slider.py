@@ -196,6 +196,34 @@ class NDotClockSlider(QWidget):
         self._system_backlight: Optional[SystemBacklightController] = None
         self._system_backlight_error_notified = False
         self._system_backlight_verbose = os.environ.get("NDOT_SYSTEM_BACKLIGHT_VERBOSE", "").lower() in ("1", "true", "yes")
+        auto_verbose_env = os.environ.get("NDOT_AUTO_BRIGHTNESS_VERBOSE", "")
+        self._auto_brightness_verbose = auto_verbose_env.lower() in ("1", "true", "yes") or self._system_backlight_verbose
+        gamma_env = os.environ.get("NDOT_AUTO_BRIGHTNESS_GAMMA", "").strip()
+        self._auto_brightness_curve_gamma = 1.8
+        if gamma_env:
+            try:
+                parsed_gamma = float(gamma_env)
+                # Clamp to a sane range to avoid flicker from extreme curves
+                self._auto_brightness_curve_gamma = max(0.3, min(parsed_gamma, 5.0))
+                if self._auto_brightness_verbose:
+                    print(
+                        f"[AutoBrightness] NDOT_AUTO_BRIGHTNESS_GAMMA={parsed_gamma:.3f} -> using {self._auto_brightness_curve_gamma:.3f}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            except ValueError:
+                if self._auto_brightness_verbose:
+                    print(
+                        f"[AutoBrightness] Invalid NDOT_AUTO_BRIGHTNESS_GAMMA='{gamma_env}', falling back to {self._auto_brightness_curve_gamma:.3f}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+        elif self._auto_brightness_verbose:
+            print(
+                f"[AutoBrightness] Using default brightness gamma {self._auto_brightness_curve_gamma:.3f}",
+                file=sys.stderr,
+                flush=True,
+            )
         self._initialize_system_backlight()
 
         self.setWindowTitle("Ndot Clock")
@@ -4850,22 +4878,13 @@ class NDotClockSlider(QWidget):
 
     def _map_ambient_to_user_brightness(self, ambient: float) -> float:
         """Map ambient 0..1 value to user brightness range."""
-        # Очень агрессивная S-образная кривая для достижения 100%
         ambient = max(0.0, min(1.0, ambient))
-        
-        # Кривая ambient^0.25 для быстрого роста
-        normalized = ambient ** 0.25
-        
-        # Дополнительное усиление ярких значений для достижения 100%
-        if normalized > 0.6:
-            # Экспоненциальное усиление: (normalized - 0.6) * 2.0
-            normalized = 0.6 + (normalized - 0.6) * 2.0
-        
-        # Гарантируем достижение 100% при максимальной яркости
-        if ambient > 0.8:
-            normalized = min(1.0, normalized + (ambient - 0.8) * 0.5)
-        
-        normalized = min(1.0, normalized)
+        normalized = ambient ** self._auto_brightness_curve_gamma
+        # Подталкиваем яркие значения к верхней границе без резкого скачка
+        if ambient > 0.85:
+            boost = min(1.0, (ambient - 0.85) / 0.15)
+            normalized += (1.0 - normalized) * boost
+        normalized = max(0.0, min(1.0, normalized))
         return self._auto_brightness_min + (self._auto_brightness_max - self._auto_brightness_min) * normalized
 
     def _on_ambient_brightness_measured(self, ambient: float):
@@ -4873,7 +4892,7 @@ class NDotClockSlider(QWidget):
         if not self._auto_brightness_enabled:
             return
         
-        if self._system_backlight_verbose:
+        if self._auto_brightness_verbose:
             print(f"[AutoBrightness] Measured ambient: {ambient:.3f}", file=sys.stderr, flush=True)
         
         # Добавляем измерение в буфер
@@ -4896,7 +4915,7 @@ class NDotClockSlider(QWidget):
         
         target = self._map_ambient_to_user_brightness(filtered_ambient)
         
-        if self._system_backlight_verbose:
+        if self._auto_brightness_verbose:
             print(f"[AutoBrightness] Filtered: {filtered_ambient:.3f}, Target: {target:.3f}", file=sys.stderr, flush=True)
         
         # Упрощённое сглаживание - анимация Безье обеспечит плавность
@@ -4906,7 +4925,7 @@ class NDotClockSlider(QWidget):
             self._auto_brightness_smoothed * smoothing + target * (1.0 - smoothing)
         )
         
-        if self._system_backlight_verbose:
+        if self._auto_brightness_verbose:
             print(f"[AutoBrightness] Smoothed: {self._auto_brightness_smoothed:.3f}", file=sys.stderr, flush=True)
         
         diff = abs(self._auto_brightness_smoothed - getattr(self, "_user_brightness", 0.8))
@@ -4915,12 +4934,12 @@ class NDotClockSlider(QWidget):
         current_time = time.time()
         if current_time - self._last_brightness_update_time < self._min_brightness_update_interval:
             # Пропускаем обновление, если прошло недостаточно времени
-            if self._system_backlight_verbose:
+            if self._auto_brightness_verbose:
                 print(f"[AutoBrightness] Skipping (too soon: {current_time - self._last_brightness_update_time:.3f}s)", file=sys.stderr, flush=True)
             return
         
         self._last_brightness_update_time = current_time
-        if self._system_backlight_verbose:
+        if self._auto_brightness_verbose:
             print(f"[AutoBrightness] Applying brightness: {self._auto_brightness_smoothed:.3f}", file=sys.stderr, flush=True)
         self._apply_brightness(self._auto_brightness_smoothed, from_auto=True)
 
