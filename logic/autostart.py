@@ -31,8 +31,7 @@ class AutostartManager:
                 return AutostartManager._check_macos_autostart()
             else:  # Linux
                 return AutostartManager._check_linux_autostart()
-        except Exception as e:
-            print(f"Error checking autostart status: {e}")
+        except Exception:
             return False
 
     @staticmethod
@@ -45,8 +44,7 @@ class AutostartManager:
                 return AutostartManager._enable_macos_autostart()
             else:  # Linux
                 return AutostartManager._enable_linux_autostart()
-        except Exception as e:
-            print(f"Error enabling autostart: {e}")
+        except Exception:
             return False
 
     @staticmethod
@@ -59,8 +57,7 @@ class AutostartManager:
                 return AutostartManager._disable_macos_autostart()
             else:  # Linux
                 return AutostartManager._disable_linux_autostart()
-        except Exception as e:
-            print(f"Error disabling autostart: {e}")
+        except Exception:
             return False
 
     # Windows implementation
@@ -103,8 +100,7 @@ class AutostartManager:
             winreg.SetValueEx(key, "NdotClock", 0, winreg.REG_SZ, exe_path)
             winreg.CloseKey(key)
             return True
-        except Exception as e:
-            print(f"Windows autostart error: {e}")
+        except Exception:
             return False
 
     @staticmethod
@@ -122,8 +118,7 @@ class AutostartManager:
             except FileNotFoundError:
                 winreg.CloseKey(key)
                 return True  # Already disabled
-        except Exception as e:
-            print(f"Windows autostart disable error: {e}")
+        except Exception:
             return False
 
     # macOS implementation
@@ -174,8 +169,7 @@ class AutostartManager:
             with open(plist_path, 'w') as f:
                 f.write(plist_content)
             return True
-        except Exception as e:
-            print(f"macOS autostart error: {e}")
+        except Exception:
             return False
 
     @staticmethod
@@ -186,8 +180,7 @@ class AutostartManager:
             if os.path.exists(plist_path):
                 os.remove(plist_path)
             return True
-        except Exception as e:
-            print(f"macOS autostart disable error: {e}")
+        except Exception:
             return False
 
     # Linux implementation
@@ -224,8 +217,7 @@ X-GNOME-Autostart-enabled=true
             # Make executable
             os.chmod(desktop_path, 0o755)
             return True
-        except Exception as e:
-            print(f"Linux autostart error: {e}")
+        except Exception:
             return False
 
     @staticmethod
@@ -236,6 +228,5 @@ X-GNOME-Autostart-enabled=true
             if os.path.exists(desktop_path):
                 os.remove(desktop_path)
             return True
-        except Exception as e:
-            print(f"Linux autostart disable error: {e}")
+        except Exception:
             return False

@@ -131,13 +131,6 @@ class UpdateChecker:
                 raw_content = reply.readAll().data().decode('utf-8')
                 latest_version = self._extract_version_from_code(raw_content)
 
-                # Debug: print version comparison
-                print(f"[Update Check] Latest version from GitHub: {latest_version}")
-                print(f"[Update Check] Current version: {__version__}")
-                if latest_version:
-                    comparison = self._compare_versions(latest_version, __version__)
-                    print(f"[Update Check] Comparison result: {comparison} (1=newer, 0=same, -1=older)")
-
                 if latest_version and self._compare_versions(latest_version, __version__) > 0:
                     # Update available
                     self._show_update_dialog(
@@ -203,7 +196,7 @@ class UpdateChecker:
                 elif p1 < p2:
                     return -1
             return 0
-        except:
+        except (ValueError, TypeError, AttributeError, IndexError):
             return 0
 
     def _show_update_dialog(self, version: str, commit_url: str, commit_message: str, commit_date: str):
@@ -335,8 +328,20 @@ class UpdateChecker:
                     command = [python]
                 else:
                     command = [python, _get_entry_script_path()]
+
                 # Use QTimer to delay restart until after quit
-                QTimer.singleShot(200, lambda: subprocess.Popen(command))
+                def restart_app():
+                    try:
+                        subprocess.Popen(
+                            command,
+                            start_new_session=True,  # Detach from parent to prevent zombie process
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL
+                        )
+                    except Exception as e:
+                        print(f"[Update] Failed to restart application: {e}", file=sys.stderr, flush=True)
+
+                QTimer.singleShot(200, restart_app)
                 QApplication.quit()
 
             self.parent.show_confirmation(

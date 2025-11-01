@@ -228,7 +228,7 @@ class AmbientLightMonitor(QThread):
             with open('/proc/cpuinfo', 'r') as f:
                 cpuinfo = f.read()
                 return 'Raspberry Pi' in cpuinfo or 'BCM' in cpuinfo
-        except:
+        except (IOError, OSError):
             return False
 
     def run(self) -> None:
@@ -303,7 +303,6 @@ class AmbientLightMonitor(QThread):
                 self._capture = self._open_camera(backend)
                 if self._capture:
                     self._using_picamera2 = False
-                    print(f"[AutoBrightness] Camera opened successfully with {backend_name}", file=sys.stderr, flush=True)
                     break
 
         # Raspberry Pi specific fallback: attempt GStreamer pipelines (v4l2src/libcamerasrc)
@@ -330,7 +329,6 @@ class AmbientLightMonitor(QThread):
                     self._capture = self._open_picamera2()
                     if self._capture:
                         self._using_picamera2 = True
-                        print("[AutoBrightness] Camera opened via Picamera2 fallback", file=sys.stderr, flush=True)
                 else:
                     error_output = result.stderr.strip()
                     if "numpy.dtype" in error_output and "binary incompatibility" in error_output:
@@ -366,35 +364,35 @@ class AmbientLightMonitor(QThread):
         if self._verbose:
             print("[AutoBrightness] Camera opened successfully, starting capture loop", file=sys.stderr, flush=True)
 
-        while self._running:
-            ret, frame = self._capture.read()
-            if not ret or frame is None:
-                failed_reads += 1
-                print(f"[AutoBrightness] Failed to read frame (attempt {failed_reads}/5)", file=sys.stderr, flush=True)
-                if failed_reads >= 5:
-                    print("[AutoBrightness] ERROR: Too many failed reads, stopping", file=sys.stderr, flush=True)
-                    self.errorOccurred.emit("capture_failed")
-                    break
-                self.msleep(self._interval_ms)
-                continue
+        try:
+            while self._running:
+                ret, frame = self._capture.read()
+                if not ret or frame is None:
+                    failed_reads += 1
+                    if failed_reads >= 5:
+                        print("[AutoBrightness] ERROR: Too many failed reads, stopping", file=sys.stderr, flush=True)
+                        self.errorOccurred.emit("capture_failed")
+                        break
+                    self.msleep(self._interval_ms)
+                    continue
 
-            failed_reads = 0
-            if isinstance(frame, np.ndarray) and frame.ndim == 3:
-                if cv2 is not None:
-                    conversion = cv2.COLOR_RGB2GRAY if self._using_picamera2 else cv2.COLOR_BGR2GRAY
-                    gray = cv2.cvtColor(frame, conversion)
+                failed_reads = 0
+                if isinstance(frame, np.ndarray) and frame.ndim == 3:
+                    if cv2 is not None:
+                        conversion = cv2.COLOR_RGB2GRAY if self._using_picamera2 else cv2.COLOR_BGR2GRAY
+                        gray = cv2.cvtColor(frame, conversion)
+                    else:
+                        gray = np.mean(frame, axis=2)
                 else:
-                    gray = np.mean(frame, axis=2)
-            else:
-                gray = frame
-            mean_brightness = float(np.mean(gray)) / 255.0
-            clamped_brightness = max(0.0, min(1.0, mean_brightness))
-            # Логируем только каждое 5-е измерение для уменьшения шума
-            # print(f"[AutoBrightness] Brightness measured: {clamped_brightness:.3f}", file=sys.stderr, flush=True)
-            self.brightnessMeasured.emit(clamped_brightness)
-            self.msleep(self._interval_ms)
-
-        self._release_capture()
+                    gray = frame
+                mean_brightness = float(np.mean(gray)) / 255.0
+                clamped_brightness = max(0.0, min(1.0, mean_brightness))
+                # Логируем только каждое 5-е измерение для уменьшения шума
+                # print(f"[AutoBrightness] Brightness measured: {clamped_brightness:.3f}", file=sys.stderr, flush=True)
+                self.brightnessMeasured.emit(clamped_brightness)
+                self.msleep(self._interval_ms)
+        finally:
+            self._release_capture()
 
     def stop(self) -> None:
         """Stop the sampling loop and wait for thread to finish."""
@@ -526,7 +524,6 @@ class AmbientLightMonitor(QThread):
         for name, pipeline in pipelines:
             capture = self._open_gstreamer_pipeline(pipeline, source=name)
             if capture:
-                print(f"[AutoBrightness] Camera opened via Raspberry Pi pipeline '{name}'", file=sys.stderr, flush=True)
                 return capture
         return None
 
