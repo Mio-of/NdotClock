@@ -4,9 +4,8 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import List, Optional, Tuple
-
 import types
+from typing import List, Optional, Tuple
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
@@ -22,6 +21,7 @@ except ImportError:  # pragma: no cover - handled at runtime
 
 _PICAMERA2_IMPORT_ERROR: Optional[BaseException] = None
 _PICAMERA2_CLASS = None
+_SIMPLEJPEG_STUB_MESSAGE: Optional[str] = None
 
 
 def _install_simplejpeg_stub(exc: BaseException) -> None:
@@ -30,6 +30,8 @@ def _install_simplejpeg_stub(exc: BaseException) -> None:
         return
     module = types.ModuleType("simplejpeg")
     message = f"simplejpeg unavailable ({exc})"
+    global _SIMPLEJPEG_STUB_MESSAGE
+    _SIMPLEJPEG_STUB_MESSAGE = message
 
     def _unsupported(*_args, **_kwargs):
         raise RuntimeError(message)
@@ -62,19 +64,17 @@ def _ensure_picamera2():
         _PICAMERA2_IMPORT_ERROR = None
         return _PICAMERA2_CLASS
     except Exception as exc:  # pragma: no cover - optional dependency on Raspberry Pi
-        if "simplejpeg" in str(exc).lower():
-            _install_simplejpeg_stub(exc)
-            try:
-                from picamera2 import Picamera2 as _Picamera2  # type: ignore
+        # Attempt to stub simplejpeg (common failure on Raspberry Pi 5 with mismatched NumPy wheels)
+        _install_simplejpeg_stub(exc)
+        try:
+            from picamera2 import Picamera2 as _Picamera2  # type: ignore
 
-                _PICAMERA2_CLASS = _Picamera2
-                _PICAMERA2_IMPORT_ERROR = None
-                return _PICAMERA2_CLASS
-            except Exception as retry_exc:  # pragma: no cover - optional dependency
-                _PICAMERA2_IMPORT_ERROR = retry_exc
-                return None
-        _PICAMERA2_IMPORT_ERROR = exc
-        return None
+            _PICAMERA2_CLASS = _Picamera2
+            _PICAMERA2_IMPORT_ERROR = None
+            return _PICAMERA2_CLASS
+        except Exception as retry_exc:  # pragma: no cover - optional dependency
+            _PICAMERA2_IMPORT_ERROR = retry_exc
+            return None
 
 
 class _Picamera2Adapter:
@@ -308,29 +308,34 @@ class AmbientLightMonitor(QThread):
             if self._verbose:
                 print(f"[AutoBrightness] Trying camera index {idx}...", file=sys.stderr, flush=True)
             try:
-                capture = cv2.VideoCapture(idx, backend)
-                if capture and capture.isOpened():
-                    # Для Raspberry Pi попробуем прочитать тестовый кадр
-                    if self._is_raspberry_pi:
-                        ret, test_frame = capture.read()
-                        if not ret or test_frame is None:
+                targets = self._build_capture_targets(idx)
+                capture = None
+                for target in targets:
+                    if self._verbose and target != idx:
+                        print(f"[AutoBrightness] -> Trying target '{target}'", file=sys.stderr, flush=True)
+                    capture = cv2.VideoCapture(target, backend)
+                    if capture and capture.isOpened():
+                        # Для Raspberry Pi попробуем прочитать тестовый кадр
+                        if self._is_raspberry_pi:
+                            ret, test_frame = capture.read()
+                            if not ret or test_frame is None:
+                                if self._verbose:
+                                    print(f"[AutoBrightness] Camera {idx} ({target}) opened but cannot read frames", file=sys.stderr, flush=True)
+                                capture.release()
+                                continue
                             if self._verbose:
-                                print(f"[AutoBrightness] Camera {idx} opened but cannot read frames", file=sys.stderr, flush=True)
-                            capture.release()
-                            continue
+                                print(f"[AutoBrightness] Camera {idx} ({target}) test read successful", file=sys.stderr, flush=True)
+
                         if self._verbose:
-                            print(f"[AutoBrightness] Camera {idx} test read successful", file=sys.stderr, flush=True)
-                    
-                    if self._verbose:
-                        print(f"[AutoBrightness] Camera {idx} opened successfully", file=sys.stderr, flush=True)
-                    if idx != self._camera_index:
-                        self._camera_index = idx
-                        if self._verbose:
-                            print(f"[AutoBrightness] Camera index resolved to {idx}", file=sys.stderr, flush=True)
-                        self.cameraIndexResolved.emit(idx)
-                    return capture
-                if capture:
-                    capture.release()
+                            print(f"[AutoBrightness] Camera {idx} ({target}) opened successfully", file=sys.stderr, flush=True)
+                        if idx != self._camera_index:
+                            self._camera_index = idx
+                            if self._verbose:
+                                print(f"[AutoBrightness] Camera index resolved to {idx}", file=sys.stderr, flush=True)
+                            self.cameraIndexResolved.emit(idx)
+                        return capture
+                    if capture:
+                        capture.release()
                 if self._verbose:
                     print(f"[AutoBrightness] Camera {idx} failed to open", file=sys.stderr, flush=True)
             except Exception as e:
@@ -527,6 +532,14 @@ class AmbientLightMonitor(QThread):
             if idx != preferred:
                 indices.append(idx)
         return indices
+
+    def _build_capture_targets(self, idx: int):
+        """Return numeric and device path targets for a given index."""
+        targets = [idx]
+        device_path = f"/dev/video{idx}"
+        if os.path.exists(device_path):
+            targets.append(device_path)
+        return targets
 
     @classmethod
     def dependencies_available(cls) -> bool:
