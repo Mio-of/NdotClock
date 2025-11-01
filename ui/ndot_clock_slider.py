@@ -188,6 +188,8 @@ class NDotClockSlider(QWidget):
         self._brightness_animation_target = self._manual_brightness
         self._brightness_animation = None  # Будет создана позже после инициализации виджета
         self._brightness_animation_active = False
+        # Текущее значение яркости дисплея (для автояркости)
+        self._current_display_brightness = self._manual_brightness
         self.brightness_slider: Optional[ModernSlider] = None
         self.auto_brightness_checkbox: Optional[QCheckBox] = None
         self._edit_mode_entry_slide = 0
@@ -4694,6 +4696,8 @@ class NDotClockSlider(QWidget):
                 self._user_brightness = 1.0
                 self._update_cached_colors()
                 self.update()
+            # Сохраняем текущее значение яркости дисплея
+            self._current_display_brightness = clamped
             # Управляем только системной подсветкой
             self._apply_system_backlight(clamped)
             return
@@ -4735,7 +4739,12 @@ class NDotClockSlider(QWidget):
             return
         
         # Вычисляем разницу для адаптивной длительности анимации
-        current_brightness = getattr(self, "_user_brightness", clamped)
+        # В режиме автояркости используем текущую яркость дисплея, иначе UI яркость
+        if self._auto_brightness_enabled and self._system_backlight:
+            current_brightness = self._current_display_brightness
+        else:
+            current_brightness = getattr(self, "_user_brightness", clamped)
+        
         diff = abs(clamped - current_brightness)
         
         # Адаптивная длительность: быстрее для больших изменений
