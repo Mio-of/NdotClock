@@ -1550,6 +1550,15 @@ class NDotClockSlider(QWidget):
 
         width = max(1, self.width())
 
+        # First check if Y position is in valid range (with expanded touch area)
+        touch_padding_y = int(card_height * 0.15)  # 15% padding for easier touch
+        if not (start_y - touch_padding_y <= pos.y() <= start_y + card_height + touch_padding_y):
+            return None
+
+        # Find the closest card by X position (eliminates dead zones between cards)
+        closest_idx = None
+        min_distance = float('inf')
+
         for idx in range(len(self.slides)):
             # Calculate card position with any swap animations applied
             displacement = idx * width + self.slide_container.offset_x
@@ -1559,12 +1568,20 @@ class NDotClockSlider(QWidget):
                 displacement += self.reorder_card_offsets[idx].x()
 
             card_x = (center_x - card_width // 2) + displacement
-            card_y = start_y
+            card_center_x = card_x + card_width // 2
 
-            # Check if position is within this card's bounds
-            if (card_x <= pos.x() <= card_x + card_width and
-                card_y <= pos.y() <= card_y + card_height):
-                return idx
+            # Calculate horizontal distance from touch point to card center
+            distance = abs(pos.x() - card_center_x)
+
+            # Update closest card if this one is closer
+            if distance < min_distance:
+                min_distance = distance
+                closest_idx = idx
+
+        # Return closest card if it's within reasonable range (within screen width)
+        # This ensures we catch touches between cards while not selecting cards too far away
+        if closest_idx is not None and min_distance < width:
+            return closest_idx
 
         return None
 
