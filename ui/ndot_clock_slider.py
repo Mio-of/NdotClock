@@ -476,6 +476,12 @@ class NDotClockSlider(QWidget):
         self.reorder_activation_timer.setSingleShot(True)
         self.reorder_activation_timer.timeout.connect(self._activate_card_reordering)
         self.reorder_pending_index: Optional[int] = None
+        self.reorder_auto_scroll_timer = QTimer(self)
+        self.reorder_auto_scroll_timer.setInterval(120)
+        self.reorder_auto_scroll_timer.setSingleShot(False)
+        self.reorder_auto_scroll_timer.timeout.connect(self._perform_reorder_auto_scroll)
+        self.reorder_auto_scroll_direction = 0
+        self._last_reorder_cursor_pos: Optional[QPoint] = None
         self._skip_release_processing = False  # исправлено: предотвращаем срабатывание свайпа после кликов по контролам
 
         # Fix: Add timeout detection for webview load hangs
@@ -1353,6 +1359,7 @@ class NDotClockSlider(QWidget):
             if self.is_reordering_card and self.reorder_drag_index is not None:
                 delta = QPointF(event.pos() - self.press_start_pos)
                 self.reorder_drag_offset = delta
+                self._update_reorder_auto_scroll(event.pos())
 
                 # Check if we should swap with another card
                 new_target = self.get_card_at_position(event.pos())
@@ -1427,6 +1434,8 @@ class NDotClockSlider(QWidget):
 
             # Handle card reordering completion
             if self.is_reordering_card and self.reorder_drag_index is not None:
+                self._stop_reorder_auto_scroll()
+                self._last_reorder_cursor_pos = None
                 # Finalize the swap
                 if self.reorder_target_index != self.reorder_drag_index:
                     # Actually swap the slides in the array
@@ -1535,7 +1544,89 @@ class NDotClockSlider(QWidget):
             self.reorder_target_index = self.reorder_pending_index
             self.reorder_drag_offset = QPointF()
             self.reorder_pending_index = None
+            self._last_reorder_cursor_pos = QPoint(self.press_start_pos)
             self.update()
+
+    def _stop_reorder_auto_scroll(self):
+        """Stop auto scrolling while reordering cards."""
+        if self.reorder_auto_scroll_timer.isActive():
+            self.reorder_auto_scroll_timer.stop()
+        self.reorder_auto_scroll_direction = 0
+
+    def _update_reorder_auto_scroll(self, cursor_pos: QPoint):
+        """Check cursor position and start/stop auto-scroll near edges."""
+        if not self.is_reordering_card:
+            self._stop_reorder_auto_scroll()
+            return
+
+        self._last_reorder_cursor_pos = QPoint(cursor_pos)
+
+        if len(self.slides) <= 1:
+            self._stop_reorder_auto_scroll()
+            return
+
+        width = max(1, self.width())
+        threshold = max(30, int(width * 0.12))
+        direction = 0
+
+        if cursor_pos.x() < threshold and self.current_slide > 0:
+            direction = -1
+        elif cursor_pos.x() > width - threshold and self.current_slide < len(self.slides) - 1:
+            direction = 1
+
+        if direction != 0:
+            if self.reorder_auto_scroll_direction != direction:
+                self.reorder_auto_scroll_direction = direction
+                self.reorder_auto_scroll_timer.start()
+            elif not self.reorder_auto_scroll_timer.isActive():
+                self.reorder_auto_scroll_timer.start()
+        else:
+            self._stop_reorder_auto_scroll()
+
+    def _perform_reorder_auto_scroll(self):
+        """Move slide strip when dragging card near edges."""
+        if not self.is_reordering_card or self.reorder_auto_scroll_direction == 0:
+            self._stop_reorder_auto_scroll()
+            return
+
+        direction = self.reorder_auto_scroll_direction
+        next_slide = self.current_slide + direction
+
+        if next_slide < 0 or next_slide >= len(self.slides):
+            self._stop_reorder_auto_scroll()
+            return
+
+        width = max(1, self.width())
+
+        if hasattr(self, 'offset_animation') and self.offset_animation and self.offset_animation.state() == QPropertyAnimation.State.Running:
+            self._finalize_offset_animation()
+
+        previous_offset = self.slide_container.get_offset_x() if self.slide_container else 0.0
+        target_offset = -next_slide * width
+
+        if self.slide_container:
+            self.slide_container.set_offset_x(target_offset)
+
+        self.current_slide = next_slide
+
+        offset_delta = target_offset - previous_offset
+        if offset_delta != 0.0:
+            self.reorder_drag_offset = QPointF(
+                self.reorder_drag_offset.x() - offset_delta,
+                self.reorder_drag_offset.y()
+            )
+            self.press_start_pos = QPoint(
+                int(self.press_start_pos.x() + offset_delta),
+                self.press_start_pos.y()
+            )
+
+        if self._last_reorder_cursor_pos is not None:
+            new_target = self.get_card_at_position(self._last_reorder_cursor_pos)
+            if new_target is not None and new_target != self.reorder_target_index:
+                self.reorder_target_index = new_target
+                self.animate_card_reordering()
+
+        self.update()
 
     def get_card_at_position(self, pos: QPoint) -> Optional[int]:
         """Get the index of the card at the given screen position in edit mode"""
@@ -1673,6 +1764,7 @@ class NDotClockSlider(QWidget):
 
         self.reorder_swap_animations.clear()
         self.reorder_card_offsets.clear()
+        self._stop_reorder_auto_scroll()
 
     def _prepare_control_click(self, pos: QPoint):
         """Reset swipe state when tapping bottom controls"""
@@ -2780,6 +2872,7 @@ class NDotClockSlider(QWidget):
         if not self.edit_mode or self._edit_transition_active:
             return
 
+        self._stop_reorder_auto_scroll()
         self.edit_mode = False
         if self.slides:
             target_slide = max(0, min(self._edit_mode_entry_slide, len(self.slides) - 1))
@@ -3873,6 +3966,46 @@ class NDotClockSlider(QWidget):
         painter.setPen(QPen(QColor(255, 255, 255, border_alpha), border_width))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawRoundedRect(int(card_x), int(card_y), card_width, card_height, 12, 12)
+
+        # Draw drag handle hint in edit mode to show card is movable
+        if (self.edit_mode and slide.get('type') != SlideType.ADD and card_width > 0 and card_height > 0):
+            handle_margin_top = max(self.get_spacing(18, 10), int(card_height * 0.04))
+            handle_height = max(self.get_ui_size(22, 14), int(card_height * 0.08))
+            handle_width = max(int(card_width * 0.28), self.get_ui_size(120, 80))
+            available_width = max(30, min(card_width - self.get_spacing(40, 24), card_width))
+            handle_width = min(handle_width, available_width)
+            handle_x = card_x + (card_width - handle_width) / 2
+            handle_y = card_y + handle_margin_top
+
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(255, 255, 255, 60))
+            painter.drawRoundedRect(
+                QRectF(handle_x, handle_y, handle_width, handle_height),
+                handle_height / 2,
+                handle_height / 2
+            )
+
+            dot_diameter = max(4, handle_height // 4)
+            dot_radius = dot_diameter / 2
+            dot_color = QColor(255, 255, 255, 170)
+            columns = 3
+            rows = 2
+            spacing_x = handle_width / (columns + 1)
+            spacing_y = handle_height / (rows + 1)
+
+            for row in range(rows):
+                for col in range(columns):
+                    cx = handle_x + (col + 1) * spacing_x
+                    cy = handle_y + (row + 1) * spacing_y
+                    painter.setBrush(dot_color)
+                    painter.drawEllipse(
+                        QRectF(
+                            cx - dot_radius,
+                            cy - dot_radius,
+                            dot_diameter,
+                            dot_diameter
+                        )
+                    )
 
         # Draw slide content with opacity based on focus/elevation
         painter.save()
