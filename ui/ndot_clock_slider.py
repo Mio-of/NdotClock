@@ -1357,8 +1357,9 @@ class NDotClockSlider(QWidget):
                 # Check if we should swap with another card
                 new_target = self.get_card_at_position(event.pos())
                 if new_target is not None and new_target != self.reorder_target_index:
-                    self.animate_card_swap(self.reorder_target_index, new_target)
+                    # исправлено: анимируем все карточки к правильным позициям относительно drag_index
                     self.reorder_target_index = new_target
+                    self.animate_card_reordering()
 
                 self.update()
                 return
@@ -1567,31 +1568,18 @@ class NDotClockSlider(QWidget):
 
         return None
 
-    def animate_card_swap(self, from_index: int, to_index: int):
-        """Animate the swap between two cards"""
-        if from_index == to_index:
+    def animate_card_reordering(self):
+        """
+        Animate all cards to their correct positions during reordering.
+        исправлено: анимирует все карточки между drag_index и target_index,
+        возвращая остальные на свои места
+        """
+        if self.reorder_drag_index is None or self.reorder_target_index is None:
             return
 
-        # Calculate displacement for animation
-        displacement = (to_index - from_index) * self.width()
-
-        # Clean up existing animations for these indices
-        for idx in [from_index, to_index]:
-            if idx in self.reorder_swap_animations:
-                old_anim = self.reorder_swap_animations[idx]
-                if old_anim.state() == QPropertyAnimation.State.Running:
-                    old_anim.stop()
-                old_anim.deleteLater()
-                del self.reorder_swap_animations[idx]
-
-        # Animate the from_index card moving to to_index position
-        # We'll store the offset in reorder_card_offsets and animate that
-
-        # Start offset at current position
-        if from_index not in self.reorder_card_offsets:
-            self.reorder_card_offsets[from_index] = QPointF(0, 0)
-        if to_index not in self.reorder_card_offsets:
-            self.reorder_card_offsets[to_index] = QPointF(0, 0)
+        drag_idx = self.reorder_drag_index
+        target_idx = self.reorder_target_index
+        width = self.width()
 
         # Create animation object with custom property
         from PyQt6.QtCore import QObject, pyqtProperty
@@ -1614,16 +1602,50 @@ class NDotClockSlider(QWidget):
 
             offset_x = pyqtProperty(float, get_offset_x, set_offset_x)
 
-        # Animate to_index card moving to from_index position
-        animator_to = CardOffsetAnimator(self, to_index, -displacement)
-        animation_to = QPropertyAnimation(animator_to, b"offset_x")
-        animation_to.setDuration(250)
-        animation_to.setEasingCurve(QEasingCurve.Type.InOutCubic)
-        animation_to.setStartValue(self.reorder_card_offsets[to_index].x())
-        animation_to.setEndValue(-displacement)
-        animation_to.start()
+        # Анимируем все карточки к правильным позициям
+        for idx in range(len(self.slides)):
+            # Пропускаем перетаскиваемую карточку - она управляется reorder_drag_offset
+            if idx == drag_idx:
+                continue
 
-        self.reorder_swap_animations[to_index] = animation_to
+            # Определяем целевое смещение для каждой карточки
+            target_offset = 0.0
+
+            if drag_idx < target_idx:
+                # Перетаскиваем вправо: карточки между drag и target сдвигаются влево
+                if drag_idx < idx <= target_idx:
+                    target_offset = -width
+            else:
+                # Перетаскиваем влево: карточки между target и drag сдвигаются вправо
+                if target_idx <= idx < drag_idx:
+                    target_offset = width
+
+            # Инициализируем offset если его нет
+            if idx not in self.reorder_card_offsets:
+                self.reorder_card_offsets[idx] = QPointF(0, 0)
+
+            current_offset = self.reorder_card_offsets[idx].x()
+
+            # Если смещение изменилось - создаём анимацию
+            if abs(current_offset - target_offset) > 0.1:
+                # Останавливаем старую анимацию для этого индекса
+                if idx in self.reorder_swap_animations:
+                    old_anim = self.reorder_swap_animations[idx]
+                    if old_anim.state() == QPropertyAnimation.State.Running:
+                        old_anim.stop()
+                    old_anim.deleteLater()
+                    del self.reorder_swap_animations[idx]
+
+                # Создаём новую анимацию
+                animator = CardOffsetAnimator(self, idx, target_offset)
+                animation = QPropertyAnimation(animator, b"offset_x")
+                animation.setDuration(250)
+                animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
+                animation.setStartValue(current_offset)
+                animation.setEndValue(target_offset)
+                animation.start()
+
+                self.reorder_swap_animations[idx] = animation
 
     def finish_all_card_animations(self):
         """Stop and clean up all card reordering animations"""
