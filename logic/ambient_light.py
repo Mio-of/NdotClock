@@ -7,7 +7,7 @@ import sys
 import types
 from typing import List, Optional, Tuple
 
-from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtCore import QThread, QMutex, pyqtSignal
 
 try:
     import numpy as np
@@ -209,6 +209,7 @@ class AmbientLightMonitor(QThread):
         self._camera_index = camera_index
         self._interval_ms = max(250, interval_ms)
         self._running = False
+        self._running_mutex = QMutex()  # Thread-safe access to _running
         self._capture = None
         self._using_picamera2 = False
         self._is_raspberry_pi = self._detect_raspberry_pi()
@@ -359,38 +360,82 @@ class AmbientLightMonitor(QThread):
             # Для RPi используем значения по умолчанию или меньшие
             print("[AutoBrightness] Using default camera resolution for Raspberry Pi", file=sys.stderr, flush=True)
         
+        self._running_mutex.lock()
         self._running = True
+        self._running_mutex.unlock()
+
         failed_reads = 0
         if self._verbose:
             print("[AutoBrightness] Camera opened successfully, starting capture loop", file=sys.stderr, flush=True)
 
         try:
-            while self._running:
-                ret, frame = self._capture.read()
-                if not ret or frame is None:
-                    failed_reads += 1
-                    if failed_reads >= 5:
-                        print("[AutoBrightness] ERROR: Too many failed reads, stopping", file=sys.stderr, flush=True)
-                        self.errorOccurred.emit("capture_failed")
-                        break
-                    self.msleep(self._interval_ms)
-                    continue
+            while True:
+                # Thread-safe check of _running flag
+                self._running_mutex.lock()
+                should_continue = self._running
+                self._running_mutex.unlock()
 
-                failed_reads = 0
-                if isinstance(frame, np.ndarray) and frame.ndim == 3:
-                    if cv2 is not None:
-                        conversion = cv2.COLOR_RGB2GRAY if self._using_picamera2 else cv2.COLOR_BGR2GRAY
-                        gray = cv2.cvtColor(frame, conversion)
-                    else:
-                        gray = np.mean(frame, axis=2)
-                else:
-                    gray = frame
-                mean_brightness = float(np.mean(gray)) / 255.0
-                clamped_brightness = max(0.0, min(1.0, mean_brightness))
-                # Логируем только каждое 5-е измерение для уменьшения шума
-                # print(f"[AutoBrightness] Brightness measured: {clamped_brightness:.3f}", file=sys.stderr, flush=True)
-                self.brightnessMeasured.emit(clamped_brightness)
+                if not should_continue:
+                    break
+
+                try:
+                    ret, frame = self._capture.read()
+                    if not ret or frame is None:
+                        failed_reads += 1
+                        if failed_reads >= 5:
+                            print("[AutoBrightness] ERROR: Too many failed reads, stopping", file=sys.stderr, flush=True)
+                            self.errorOccurred.emit("capture_failed")
+                            break
+                        self.msleep(self._interval_ms)
+                        continue
+
+                    failed_reads = 0
+
+                    # Validate frame before processing
+                    if not isinstance(frame, np.ndarray):
+                        if self._verbose:
+                            print("[AutoBrightness] WARNING: Frame is not ndarray, skipping", file=sys.stderr, flush=True)
+                        self.msleep(self._interval_ms)
+                        continue
+
+                    if frame.size == 0:
+                        if self._verbose:
+                            print("[AutoBrightness] WARNING: Frame is empty, skipping", file=sys.stderr, flush=True)
+                        self.msleep(self._interval_ms)
+                        continue
+
+                    # Process frame with exception handling
+                    try:
+                        if frame.ndim == 3:
+                            if cv2 is not None:
+                                conversion = cv2.COLOR_RGB2GRAY if self._using_picamera2 else cv2.COLOR_BGR2GRAY
+                                gray = cv2.cvtColor(frame, conversion)
+                            else:
+                                gray = np.mean(frame, axis=2)
+                        else:
+                            gray = frame
+
+                        mean_brightness = float(np.mean(gray)) / 255.0
+                        clamped_brightness = max(0.0, min(1.0, mean_brightness))
+                        self.brightnessMeasured.emit(clamped_brightness)
+
+                    except (cv2.error, ValueError, TypeError, AttributeError) as e:
+                        if self._verbose:
+                            print(f"[AutoBrightness] WARNING: Frame processing error: {e}", file=sys.stderr, flush=True)
+                        self.msleep(self._interval_ms)
+                        continue
+
+                except Exception as e:
+                    print(f"[AutoBrightness] ERROR: Unexpected error in capture loop: {e}", file=sys.stderr, flush=True)
+                    self.errorOccurred.emit("unexpected_error")
+                    break
+
                 self.msleep(self._interval_ms)
+
+        except Exception as e:
+            print(f"[AutoBrightness] CRITICAL: Fatal error in run(): {e}", file=sys.stderr, flush=True)
+            import traceback
+            traceback.print_exc(file=sys.stderr)
         finally:
             self._release_capture()
 
@@ -398,7 +443,12 @@ class AmbientLightMonitor(QThread):
         """Stop the sampling loop and wait for thread to finish."""
         if not self.isRunning():
             return
+
+        # Thread-safe stop signal
+        self._running_mutex.lock()
         self._running = False
+        self._running_mutex.unlock()
+
         self.wait(1500)
         self._release_capture()
 

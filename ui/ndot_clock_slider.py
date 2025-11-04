@@ -509,13 +509,17 @@ class NDotClockSlider(QWidget):
         self.location_lat = None
 
         # Fix: JSON parser thread for non-blocking parsing
-        self.json_parser_thread = None
+        # Separate threads for location and weather parsing to avoid race conditions
+        self.location_parser_thread: Optional[JsonParserThread] = None
+        self.weather_parser_thread: Optional[JsonParserThread] = None
         self.location_lon = None
         self.location_loading = False
 
-        # Fix: Cache QFont objects for performance (ARM optimization)
+        # Fix: Cache QFont objects for performance (ARM optimization) with LRU limits
         self._font_cache: Dict[Tuple[str, int], QFont] = {}
+        self._font_cache_max_size = 50  # LRU limit to prevent unbounded growth
         self._fontmetrics_cache: Dict[Tuple[str, int], QFontMetrics] = {}
+        self._fontmetrics_cache_max_size = 50
 
         # Edit panel
         self.edit_panel = None
@@ -733,22 +737,26 @@ class NDotClockSlider(QWidget):
         return max(min_spacing, int(base_800x480 * self.scale_factor))
 
     def calculate_display_parameters(self):
-        """Calculate dot sizes based on window size"""
+        """Calculate dot sizes based on window size with division by zero protection"""
         canvas_width = max(1, self.width())
         canvas_height = max(1, self.height())
-        
+
         base_dot_size = 44
-        base_dot_spacing = 50
+        base_dot_spacing = max(1, 50)  # Protect against zero
         base_inter_digit_spacing = 60
-        
+
         ratio_dot = base_dot_size / base_dot_spacing
         ratio_inter = base_inter_digit_spacing / base_dot_spacing
-        
+
         units_width = 4 * (2 + ratio_dot) + 3 * ratio_inter
         # Height units consider digits plus date spacing
         date_spacing_units = 3.0  # empirical spacing below digits for date text
         units_height = 5 + ratio_dot + date_spacing_units
-        
+
+        # Protect against division by zero
+        units_width = max(1.0, units_width)
+        units_height = max(1.0, units_height)
+
         s_by_width = canvas_width / units_width
         s_by_height = canvas_height / units_height
         base_s = min(s_by_width, s_by_height)
@@ -1145,30 +1153,56 @@ class NDotClockSlider(QWidget):
         reply = self.network_manager.get(request)
         reply.finished.connect(lambda: self.handle_location_response(reply))
 
+    def _cleanup_parser_thread(self, thread_attr: str):
+        """Safely cleanup a JSON parser thread to prevent memory leaks."""
+        old_thread = getattr(self, thread_attr, None)
+        if not old_thread:
+            return
+
+        setattr(self, thread_attr, None)
+
+        # Disconnect signals to prevent callbacks after deletion
+        try:
+            old_thread.finished.disconnect()
+        except (RuntimeError, TypeError):
+            pass
+        try:
+            old_thread.error.disconnect()
+        except (RuntimeError, TypeError):
+            pass
+
+        # Stop thread if running
+        if old_thread.isRunning():
+            old_thread.quit()
+            old_thread.wait(100)  # Short timeout
+
+        # Schedule deletion
+        old_thread.deleteLater()
+
     def handle_location_response(self, reply: QNetworkReply):
         """Handle location API response"""
-        self.location_loading = False
+        try:
+            self.location_loading = False
 
-        if reply.error() == QNetworkReply.NetworkError.NoError:
-            try:
-                response_data = bytes(reply.readAll()).decode()
+            if reply.error() == QNetworkReply.NetworkError.NoError:
+                try:
+                    response_data = bytes(reply.readAll()).decode()
 
-                # Fix: Parse JSON in background thread to avoid blocking UI
-                if self.json_parser_thread and self.json_parser_thread.isRunning():
-                    self.json_parser_thread.quit()
-                    self.json_parser_thread.wait()
+                    # Clean up old location parser thread
+                    self._cleanup_parser_thread('location_parser_thread')
 
-                self.json_parser_thread = JsonParserThread(response_data, 'location')
-                self.json_parser_thread.finished.connect(self._on_location_parsed)
-                self.json_parser_thread.error.connect(self._on_json_parse_error)
-                self.json_parser_thread.start()
+                    # Create new parser thread
+                    self.location_parser_thread = JsonParserThread(response_data, 'location')
+                    self.location_parser_thread.finished.connect(self._on_location_parsed)
+                    self.location_parser_thread.error.connect(self._on_json_parse_error)
+                    self.location_parser_thread.start()
 
-            except Exception as e:
-                self.weather_status_message = f"Location error: {str(e)}"
-        else:
-            self.weather_status_message = f"Location failed: {reply.errorString()}"
-
-        reply.deleteLater()
+                except Exception as e:
+                    self.weather_status_message = f"Location error: {str(e)}"
+            else:
+                self.weather_status_message = f"Location failed: {reply.errorString()}"
+        finally:
+            reply.deleteLater()
 
     def _on_location_parsed(self, data: dict, data_type: str):
         """Handle parsed location data"""
@@ -1216,30 +1250,30 @@ class NDotClockSlider(QWidget):
 
     def handle_weather_response(self, reply: QNetworkReply):
         """Handle weather API response"""
-        self.weather_loading = False
+        try:
+            self.weather_loading = False
 
-        if reply.error() == QNetworkReply.NetworkError.NoError:
-            try:
-                response_data = bytes(reply.readAll()).decode()
+            if reply.error() == QNetworkReply.NetworkError.NoError:
+                try:
+                    response_data = bytes(reply.readAll()).decode()
 
-                # Fix: Parse JSON in background thread to avoid blocking UI
-                if self.json_parser_thread and self.json_parser_thread.isRunning():
-                    self.json_parser_thread.quit()
-                    self.json_parser_thread.wait()
+                    # Clean up old weather parser thread
+                    self._cleanup_parser_thread('weather_parser_thread')
 
-                self.json_parser_thread = JsonParserThread(response_data, 'weather')
-                self.json_parser_thread.finished.connect(self._on_weather_parsed)
-                self.json_parser_thread.error.connect(self._on_json_parse_error)
-                self.json_parser_thread.start()
+                    # Create new parser thread
+                    self.weather_parser_thread = JsonParserThread(response_data, 'weather')
+                    self.weather_parser_thread.finished.connect(self._on_weather_parsed)
+                    self.weather_parser_thread.error.connect(self._on_json_parse_error)
+                    self.weather_parser_thread.start()
 
-            except Exception as e:
-                self.weather_status_message = f"Weather error: {str(e)}"
+                except Exception as e:
+                    self.weather_status_message = f"Weather error: {str(e)}"
+                    self.update()
+            else:
+                self.weather_status_message = f"Weather failed: {reply.errorString()}"
                 self.update()
-        else:
-            self.weather_status_message = f"Weather failed: {reply.errorString()}"
-            self.update()
-
-        reply.deleteLater()
+        finally:
+            reply.deleteLater()
 
     def _on_weather_parsed(self, data: dict, data_type: str):
         """Handle parsed weather data"""
@@ -3319,9 +3353,14 @@ class NDotClockSlider(QWidget):
         if not hasattr(webview, 'opacity_effect') or webview.opacity_effect is None:
             return
 
-        # Fix: Limit concurrent animations to prevent memory leak
-        if len(self._webview_fade_animations) >= self._max_webview_fade_animations:
-            # Stop and remove oldest animation
+        # Clean up completed animations first
+        self._webview_fade_animations = [
+            anim for anim in self._webview_fade_animations
+            if anim.state() == QPropertyAnimation.State.Running
+        ]
+
+        # Limit concurrent animations to prevent memory leak
+        while len(self._webview_fade_animations) >= self._max_webview_fade_animations:
             oldest = self._webview_fade_animations.pop(0)
             if oldest.state() == QPropertyAnimation.State.Running:
                 oldest.stop()
@@ -3333,11 +3372,21 @@ class NDotClockSlider(QWidget):
         fade_animation.setStartValue(0.0)
         fade_animation.setEndValue(1.0)
         fade_animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
+
+        # Safe removal from list on finish
+        def on_finished():
+            try:
+                if fade_animation in self._webview_fade_animations:
+                    self._webview_fade_animations.remove(fade_animation)
+            except (ValueError, RuntimeError):
+                pass  # Already removed or destroyed
+            fade_animation.deleteLater()
+
+        fade_animation.finished.connect(on_finished)
         fade_animation.start()
 
         # Keep reference to prevent garbage collection
         self._webview_fade_animations.append(fade_animation)
-        fade_animation.finished.connect(lambda: self._webview_fade_animations.remove(fade_animation) if fade_animation in self._webview_fade_animations else None)
 
     def update_active_webviews(self):
         """Synchronize embedded webviews with slides
@@ -3680,13 +3729,6 @@ class NDotClockSlider(QWidget):
         
         if not self.edit_mode and (not self.nav_hidden or self._nav_opacity > 0.0):
             self.draw_navigation_dots(painter)
-
-        if self._user_brightness < 1.0:
-            overlay_alpha = int((1.0 - self._user_brightness) * 210)
-            if overlay_alpha > 0:
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(QColor(0, 0, 0, overlay_alpha))
-                painter.drawRect(self.rect())  # исправлено: равномерно затемняем UI при снижении яркости
 
     def draw_slides_normal_mode(self, painter: QPainter):
         """Draw slides in normal viewing mode"""
@@ -4069,26 +4111,47 @@ class NDotClockSlider(QWidget):
         painter.drawPixmap(int(x - half_size), int(y - half_size), pixmap)
 
     def _get_cached_font(self, family: str, size: int) -> QFont:
-        """Fix: Get cached QFont object for performance"""
+        """Get cached QFont object for performance with LRU eviction"""
         cache_key = (family, size)
-        if cache_key not in self._font_cache:
-            font = QFont(family, size)
-            try:
-                font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias | QFont.StyleStrategy.PreferQuality)
-            except AttributeError:
-                font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
-            if hasattr(font, "setHintingPreference"):
-                font.setHintingPreference(QFont.HintingPreference.PreferFullHinting)
-            self._font_cache[cache_key] = font
-        return self._font_cache[cache_key]
+
+        if cache_key in self._font_cache:
+            return self._font_cache[cache_key]
+
+        # LRU eviction if cache is full
+        if len(self._font_cache) >= self._font_cache_max_size:
+            # Remove oldest entry (first key in dict - Python 3.7+ maintains insertion order)
+            oldest_key = next(iter(self._font_cache))
+            del self._font_cache[oldest_key]
+
+        # Create new font
+        font = QFont(family, size)
+        try:
+            font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias | QFont.StyleStrategy.PreferQuality)
+        except AttributeError:
+            font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+        if hasattr(font, "setHintingPreference"):
+            font.setHintingPreference(QFont.HintingPreference.PreferFullHinting)
+
+        self._font_cache[cache_key] = font
+        return font
 
     def _get_cached_fontmetrics(self, family: str, size: int) -> QFontMetrics:
-        """Fix: Get cached QFontMetrics object for performance"""
+        """Get cached QFontMetrics object for performance with LRU eviction"""
         cache_key = (family, size)
-        if cache_key not in self._fontmetrics_cache:
-            font = self._get_cached_font(family, size)
-            self._fontmetrics_cache[cache_key] = QFontMetrics(font)
-        return self._fontmetrics_cache[cache_key]
+
+        if cache_key in self._fontmetrics_cache:
+            return self._fontmetrics_cache[cache_key]
+
+        # LRU eviction if cache is full
+        if len(self._fontmetrics_cache) >= self._fontmetrics_cache_max_size:
+            oldest_key = next(iter(self._fontmetrics_cache))
+            del self._fontmetrics_cache[oldest_key]
+
+        # Create new font metrics
+        font = self._get_cached_font(family, size)
+        metrics = QFontMetrics(font)
+        self._fontmetrics_cache[cache_key] = metrics
+        return metrics
 
     def draw_date(self, painter: QPainter, canvas_width: int, canvas_height: int, now: datetime):
         """Draw date below clock"""
@@ -4127,7 +4190,8 @@ class NDotClockSlider(QWidget):
 
         if not self.weather_data:
             loading_font_size = max(14, int(20 * height_scale))
-            painter.setPen(QColor(150, 150, 150))
+            loading_color = self._scale_color_by_brightness(QColor(150, 150, 150))
+            painter.setPen(loading_color)
             painter.setFont(QFont(self.font_family, loading_font_size))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._tr("loading_weather"))
             return
@@ -4149,7 +4213,11 @@ class NDotClockSlider(QWidget):
                 cached_pixmap = self._svg_weather_cache[cache_key]
                 icon_width = cached_pixmap.width()
                 icon_x = int((content_width - icon_width) / 2)
+                # Применяем brightness к иконке через opacity
+                old_opacity = painter.opacity()
+                painter.setOpacity(old_opacity * self._user_brightness)
                 painter.drawPixmap(icon_x, current_y, cached_pixmap)
+                painter.setOpacity(old_opacity)
             else:
                 # Render SVG to pixmap and cache it
                 svg_renderer = QSvgRenderer(icon_path)
@@ -4177,9 +4245,12 @@ class NDotClockSlider(QWidget):
                     # Cache the pixmap
                     self._svg_weather_cache[cache_key] = pixmap
 
-                    # Draw cached pixmap
+                    # Draw cached pixmap с brightness
                     icon_x = int((content_width - icon_width) / 2)
+                    old_opacity = painter.opacity()
+                    painter.setOpacity(old_opacity * self._user_brightness)
                     painter.drawPixmap(icon_x, current_y, pixmap)
+                    painter.setOpacity(old_opacity)
 
             current_y += icon_height + max(12, int(content_height * 0.06))
 
@@ -4188,7 +4259,7 @@ class NDotClockSlider(QWidget):
 
         if slide_data.get('show_temp', True):
             temp = self.weather_data['temp']
-            temp_color = self.get_temperature_color(temp)
+            temp_color = self._scale_color_by_brightness(self.get_temperature_color(temp))
             temp_font_size = max(28, int(content_height * 0.18))
             temp_font = self._get_cached_font(self.font_family, temp_font_size)
             painter.setPen(temp_color)
@@ -4204,7 +4275,8 @@ class NDotClockSlider(QWidget):
             desc = self.get_weather_description(code)
             desc_font_size = max(13, int(content_height * 0.065))
             desc_font = self._get_cached_font(self.font_family, desc_font_size)
-            painter.setPen(QColor(200, 200, 200))
+            desc_color = self._scale_color_by_brightness(QColor(200, 200, 200))
+            painter.setPen(desc_color)
             painter.setFont(desc_font)
             desc_metrics = self._get_cached_fontmetrics(self.font_family, desc_font_size)
             desc_height = desc_metrics.height()
@@ -4218,7 +4290,8 @@ class NDotClockSlider(QWidget):
             wind_text = self._tr("weather_wind", speed=wind_speed)
             wind_font_size = max(11, int(content_height * 0.05))
             wind_font = self._get_cached_font(self.font_family, wind_font_size)
-            painter.setPen(QColor(150, 150, 150))
+            wind_color = self._scale_color_by_brightness(QColor(150, 150, 150))
+            painter.setPen(wind_color)
             painter.setFont(wind_font)
             wind_metrics = self._get_cached_fontmetrics(self.font_family, wind_font_size)
             wind_height = wind_metrics.height()
@@ -4229,7 +4302,8 @@ class NDotClockSlider(QWidget):
 
         if not sections_drawn:
             fallback_font_size = max(14, int(content_height * 0.07))
-            painter.setPen(QColor(120, 120, 120))
+            fallback_color = self._scale_color_by_brightness(QColor(120, 120, 120))
+            painter.setPen(fallback_color)
             painter.setFont(self._get_cached_font(self.font_family, fallback_font_size))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._tr("loading_weather"))
 
@@ -4407,7 +4481,8 @@ class NDotClockSlider(QWidget):
 
         circle_rect = QRectF(center_x - icon_size / 2, icon_center_y - icon_size / 2, icon_size, icon_size)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(0, 153, 255, 220))
+        circle_color = self._scale_color_by_brightness(QColor(0, 153, 255, 220))
+        painter.setBrush(circle_color)
         painter.drawEllipse(circle_rect)
 
         house_width = icon_size * 0.6
@@ -4423,7 +4498,8 @@ class NDotClockSlider(QWidget):
         path.lineTo(center_x + house_width * 0.55, base_top + house_height)
         path.lineTo(center_x + house_width * 0.55, base_top)
         path.closeSubpath()
-        painter.setBrush(QColor(255, 255, 255))
+        house_color = self._scale_color_by_brightness(QColor(255, 255, 255))
+        painter.setBrush(house_color)
         painter.drawPath(path)
 
         door_width = house_width * 0.22
@@ -4433,12 +4509,14 @@ class NDotClockSlider(QWidget):
 
         window_radius = max(4, icon_size * 0.06)
         window_offset = house_width * 0.2
-        painter.setBrush(QColor(0, 153, 255, 220))
+        window_color = self._scale_color_by_brightness(QColor(0, 153, 255, 220))
+        painter.setBrush(window_color)
         painter.drawEllipse(QPointF(center_x - window_offset, base_top + house_height * 0.45), window_radius, window_radius)
         painter.drawEllipse(QPointF(center_x + window_offset, base_top + house_height * 0.45), window_radius, window_radius)
 
         title_font_size = max(16, int(24 * self.scale_factor))
-        painter.setPen(QColor(240, 240, 240))
+        title_color = self._scale_color_by_brightness(QColor(240, 240, 240))
+        painter.setPen(title_color)
         painter.setFont(QFont(self.font_family, title_font_size, QFont.Weight.Bold))
         margin = int(30 * self.scale_factor)
         title_top = int(self.height() * 0.58)
@@ -4495,9 +4573,11 @@ class NDotClockSlider(QWidget):
 
             painter.setPen(Qt.PenStyle.NoPen)
             if i == self.current_slide:
-                painter.setBrush(QColor(255, 255, 255))
+                dot_color = self._scale_color_by_brightness(QColor(255, 255, 255))
+                painter.setBrush(dot_color)
             else:
-                painter.setBrush(QColor(70, 70, 70))
+                dot_color = self._scale_color_by_brightness(QColor(70, 70, 70))
+                painter.setBrush(dot_color)
 
             painter.drawRoundedRect(x, y, dot_width, dot_height, radius, radius)
 
@@ -4632,9 +4712,11 @@ class NDotClockSlider(QWidget):
 
             painter.setPen(Qt.PenStyle.NoPen)
             if i == self.current_slide:
-                painter.setBrush(QColor(255, 255, 255))
+                dot_color = self._scale_color_by_brightness(QColor(255, 255, 255))
+                painter.setBrush(dot_color)
             else:
-                painter.setBrush(QColor(70, 70, 70))
+                dot_color = self._scale_color_by_brightness(QColor(70, 70, 70))
+                painter.setBrush(dot_color)
 
             painter.drawRoundedRect(x, y, dot_width, dot_height, radius, radius)
 
@@ -4649,31 +4731,37 @@ class NDotClockSlider(QWidget):
         for lang, rect in layout["language_rects"]:
             painter.setPen(Qt.PenStyle.NoPen)
             if lang == self.current_language:
-                painter.setBrush(QColor(255, 255, 255))
-                text_color = QColor(35, 35, 35)
+                btn_color = self._scale_color_by_brightness(QColor(255, 255, 255))
+                text_color = self._scale_color_by_brightness(QColor(35, 35, 35))
+                painter.setBrush(btn_color)
             else:
-                painter.setBrush(QColor(70, 70, 70))
-                text_color = QColor(220, 220, 220)
+                btn_color = self._scale_color_by_brightness(QColor(70, 70, 70))
+                text_color = self._scale_color_by_brightness(QColor(220, 220, 220))
+                painter.setBrush(btn_color)
             painter.drawRoundedRect(rect, radius, radius)
             painter.setPen(text_color)
             painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, lang)
 
         update_rect = layout["update_rect"]
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(45, 45, 45))
+        update_bg = self._scale_color_by_brightness(QColor(45, 45, 45))
+        painter.setBrush(update_bg)
         painter.drawRoundedRect(update_rect, radius, radius)
-        painter.setPen(QColor(200, 200, 200))
+        update_text = self._scale_color_by_brightness(QColor(200, 200, 200))
+        painter.setPen(update_text)
         painter.drawText(update_rect, Qt.AlignmentFlag.AlignCenter, f"UPDATE · v{__version__}")
 
         autostart_rect = layout["autostart_rect"]
         autostart_enabled = AutostartManager.get_autostart_status()
         painter.setPen(Qt.PenStyle.NoPen)
         if autostart_enabled:
-            painter.setBrush(QColor(60, 180, 100))
-            text_color = QColor(255, 255, 255)
+            btn_color = self._scale_color_by_brightness(QColor(60, 180, 100))
+            text_color = self._scale_color_by_brightness(QColor(255, 255, 255))
+            painter.setBrush(btn_color)
         else:
-            painter.setBrush(QColor(70, 70, 70))
-            text_color = QColor(220, 220, 220)
+            btn_color = self._scale_color_by_brightness(QColor(70, 70, 70))
+            text_color = self._scale_color_by_brightness(QColor(220, 220, 220))
+            painter.setBrush(btn_color)
         painter.drawRoundedRect(autostart_rect, radius, radius)
         painter.setPen(text_color)
         painter.drawText(autostart_rect, Qt.AlignmentFlag.AlignCenter, self._tr("autostart_button"))
@@ -4873,26 +4961,79 @@ class NDotClockSlider(QWidget):
                     notification_type="warning",
                 )
 
+    def _scale_color_by_brightness(self, color: QColor) -> QColor:
+        """Масштабирует цвет по текущей яркости"""
+        scaled = QColor(color)
+        scaled.setRed(int(scaled.red() * self._user_brightness))
+        scaled.setGreen(int(scaled.green() * self._user_brightness))
+        scaled.setBlue(int(scaled.blue() * self._user_brightness))
+        return scaled
+
+    def _apply_brightness_to_webviews(self, brightness: float):
+        """Применяет затемнение к webview виджетам через CSS filter"""
+        # Создаем CSS фильтр для brightness
+        # brightness(1.0) = нормальная яркость, brightness(0.5) = 50% яркость
+        filter_css = f"filter: brightness({brightness:.3f});"
+
+        # Применяем к YouTube webview
+        if hasattr(self, 'youtube_webview') and self.youtube_webview:
+            try:
+                page = self.youtube_webview.page()
+                if page:
+                    # Применяем CSS фильтр к body
+                    js_code = f"""
+                    (function() {{
+                        let style = document.getElementById('ndot-brightness-filter');
+                        if (!style) {{
+                            style = document.createElement('style');
+                            style.id = 'ndot-brightness-filter';
+                            document.head.appendChild(style);
+                        }}
+                        style.textContent = 'html, body {{ {filter_css} }}';
+                    }})();
+                    """
+                    page.runJavaScript(js_code)
+            except Exception:
+                pass
+
+        # Применяем к Home Assistant webview
+        if hasattr(self, 'home_assistant_webview') and self.home_assistant_webview:
+            try:
+                page = self.home_assistant_webview.page()
+                if page:
+                    js_code = f"""
+                    (function() {{
+                        let style = document.getElementById('ndot-brightness-filter');
+                        if (!style) {{
+                            style = document.createElement('style');
+                            style.id = 'ndot-brightness-filter';
+                            document.head.appendChild(style);
+                        }}
+                        style.textContent = 'html, body {{ {filter_css} }}';
+                    }})();
+                    """
+                    page.runJavaScript(js_code)
+            except Exception:
+                pass
+
     def _apply_brightness_direct(self, value: float):
         """Прямое применение яркости без анимации (используется внутри анимации)"""
         clamped = max(0.0, min(1.0, float(value)))
-        
-        # При включенной автояркости с системной подсветкой:
-        # - UI яркость всегда максимальная (1.0)
-        # - Управляем только системной подсветкой
-        if self._auto_brightness_enabled and self._system_backlight:
+
+        # Если доступна системная подсветка - используем только её
+        if self._system_backlight:
             if self._system_backlight_verbose:
                 if (
                     self._system_backlight_last_ui_log is None
                     or abs(self._system_backlight_last_ui_log - clamped) >= 0.02
                 ):
                     print(
-                        f"[Backlight] Auto-brightness mode: UI=1.0, Display={clamped:.3f}",
+                        f"[Backlight] Hardware backlight mode: UI=1.0, Display={clamped:.3f}",
                         file=sys.stderr,
                         flush=True,
                     )
                     self._system_backlight_last_ui_log = clamped
-            # Устанавливаем UI яркость на максимум, если она не максимальная
+            # Устанавливаем UI яркость на максимум (контент остается ярким)
             if not math.isclose(self._user_brightness, 1.0, rel_tol=1e-3):
                 if self._system_backlight_verbose:
                     print(f"[Backlight] Setting UI brightness to 1.0 (was {self._user_brightness:.3f})", file=sys.stderr, flush=True)
@@ -4903,17 +5044,19 @@ class NDotClockSlider(QWidget):
             self._current_display_brightness = clamped
             # Управляем только системной подсветкой
             self._apply_system_backlight(clamped)
+            # Webview остаются на полной яркости
+            self._apply_brightness_to_webviews(1.0)
             return
-        
-        # Обычный режим: проверяем, изменилась ли яркость
-        if math.isclose(clamped, getattr(self, "_user_brightness", 0.0), rel_tol=1e-3):
-            self._apply_system_backlight(clamped)
-            return
-        
-        self._user_brightness = clamped
-        self._update_cached_colors()
-        self.update()
-        self._apply_system_backlight(clamped)
+
+        # Режим software brightness: используем color scaling
+        # Затемняем painted content через масштабирование цветов
+        if not math.isclose(clamped, self._user_brightness, rel_tol=1e-3):
+            self._user_brightness = clamped
+            self._update_cached_colors()
+            self.update()
+
+        # Применяем затемнение к webview виджетам
+        self._apply_brightness_to_webviews(clamped)
     
     def _apply_brightness(self, value: float, *, from_auto: bool):
         """Apply brightness value with Bezier curve animation for auto-brightness."""
@@ -4945,25 +5088,22 @@ class NDotClockSlider(QWidget):
             self._backlight_last_apply_log = None
             return
 
-        if self._auto_brightness_enabled and self._system_backlight:
+        if self._system_backlight:
             # При управлении аппаратной подсветкой нет смысла запускать UI-анимацию
             self._apply_brightness_direct(clamped)
             return
-        
-        # Для автояркости - с анимацией по кривой Безье
+
+        # Для автояркости с software brightness - с анимацией по кривой Безье
         if not self._brightness_animation:
             # Fallback на прямое применение, если анимация не инициализирована
             if self._system_backlight_verbose:
                 print(f"[Backlight] No animation object, applying directly", file=sys.stderr, flush=True)
             self._apply_brightness_direct(clamped)
             return
-        
+
         # Вычисляем разницу для адаптивной длительности анимации
-        # В режиме автояркости используем текущую яркость дисплея, иначе UI яркость
-        if self._auto_brightness_enabled and self._system_backlight:
-            current_brightness = self._current_display_brightness
-        else:
-            current_brightness = getattr(self, "_user_brightness", clamped)
+        # В software brightness режиме используем _user_brightness
+        current_brightness = getattr(self, "_user_brightness", clamped)
         
         diff = abs(clamped - current_brightness)
         
@@ -5241,8 +5381,11 @@ class NDotClockSlider(QWidget):
         """Stop and dispose current ambient monitor instance if any."""
         if self._ambient_light_monitor is None:
             return
+
         monitor = self._ambient_light_monitor
         self._ambient_light_monitor = None
+
+        # Disconnect signals
         try:
             monitor.brightnessMeasured.disconnect(self._on_ambient_brightness_measured)
         except (RuntimeError, TypeError):
@@ -5255,8 +5398,19 @@ class NDotClockSlider(QWidget):
             monitor.cameraIndexResolved.disconnect(self._on_auto_brightness_camera_resolved)
         except (RuntimeError, TypeError):
             pass
-        monitor.stop()
-        monitor.deleteLater()
+
+        # Async stop - don't block UI
+        monitor.stop()  # Sets _running = False
+
+        # Schedule cleanup with timeout for forceful termination if needed
+        def force_cleanup():
+            if monitor.isRunning():
+                print("[AutoBrightness] WARNING: Monitor thread still running after timeout, terminating", file=sys.stderr, flush=True)
+                monitor.terminate()  # Forceful stop
+            monitor.deleteLater()
+
+        # Give thread 500ms to stop gracefully, then force cleanup
+        QTimer.singleShot(500, force_cleanup)
 
     def set_auto_brightness_enabled(self, enabled: bool, user_triggered: bool = False):
         """Toggle webcam-based auto brightness."""
@@ -5418,34 +5572,41 @@ class NDotClockSlider(QWidget):
             if hasattr(self, 'edit_panel') and self.edit_panel:
                 self.edit_panel.deleteLater()
 
-            # Stop all timers
-            if hasattr(self, 'main_timer'):
-                self.main_timer.stop()
-            if hasattr(self, 'weather_timer'):
-                self.weather_timer.stop()
-            if hasattr(self, 'nav_hide_timer'):
-                self.nav_hide_timer.stop()
-            if hasattr(self, 'long_press_timer'):
-                self.long_press_timer.stop()
-            if hasattr(self, 'clock_return_timer'):
-                self.clock_return_timer.stop()
+            # Clean up JSON parser threads
+            self._cleanup_parser_thread('location_parser_thread')
+            self._cleanup_parser_thread('weather_parser_thread')
 
-            # Clean up animations
+            # Stop and delete all timers
+            for timer_attr in ('main_timer', 'weather_timer', 'nav_hide_timer',
+                              'long_press_timer', 'clock_return_timer',
+                              'update_check_timer', 'reorder_activation_timer'):
+                timer = getattr(self, timer_attr, None)
+                if timer:
+                    timer.stop()
+                    timer.deleteLater()
+
+            # Clean up webview fade animations
             if hasattr(self, '_webview_fade_animations'):
                 for anim in self._webview_fade_animations:
                     if anim.state() == QPropertyAnimation.State.Running:
                         anim.stop()
+                    anim.deleteLater()
+                self._webview_fade_animations.clear()
 
 
-            # исправлено: корректно уничтожаем веб-вью, чтобы профили закрывались
+            # Clean up webviews with proper profile disposal
             for attr in ('youtube_webview', 'home_assistant_webview'):
                 webview = getattr(self, attr, None)
                 if webview:
-                    # Правильная последовательность закрытия webview
-                    webview.stop()  # Останавливаем загрузку
+                    webview.stop()  # Stop loading
                     page = webview.page()
                     if page:
-                        page.deleteLater()  # Удаляем страницу перед webview
+                        # Clean up profile to prevent memory leak
+                        profile = page.profile()
+                        if profile and not profile.isOffTheRecord():
+                            # Only delete non-shared profiles
+                            profile.deleteLater()
+                        page.deleteLater()
                     webview.hide()
                     webview.setParent(None)
                     webview.deleteLater()
