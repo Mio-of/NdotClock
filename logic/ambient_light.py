@@ -255,6 +255,11 @@ class AmbientLightMonitor(QThread):
             print("[AutoBrightness] Starting ambient light monitor thread", file=sys.stderr, flush=True)
 
         # Safety latch: allow disabling camera via environment variable
+        self._verbose = os.environ.get("NDOT_AUTO_BRIGHTNESS_VERBOSE", "").lower() in ("1", "true", "yes")
+        self._is_pi_5 = self._detect_raspberry_pi_5()
+        # Picamera2 fallback enabled by default on Raspberry Pi
+        self._enable_picamera2 = self._is_raspberry_pi
+
         if os.environ.get("NDOT_NO_CAMERA", "").lower() in ("1", "true", "yes"):
             print("[AutoBrightness] Camera disabled via NDOT_NO_CAMERA environment variable", file=sys.stderr, flush=True)
             self.errorOccurred.emit("camera_disabled_by_user")
@@ -460,13 +465,15 @@ class AmbientLightMonitor(QThread):
         self._running = False
         self._running_mutex.unlock()
 
-        # Wait for thread to finish with timeout
-        if not self.wait(2000):  # Increased timeout to 2s
-            # Force terminate if thread doesn't stop gracefully
-            self.terminate()
-            self.wait(500)  # Wait a bit after terminate
+        # Wait briefly for thread to finish
+        # We avoid long waits or terminate() to prevent UI freezes and resource leaks
+        if not self.wait(300):  # 300ms timeout
+            print("[AutoBrightness] Thread did not stop immediately, continuing in background", file=sys.stderr, flush=True)
+            # Do NOT terminate. Let it finish gracefully when the current blocking call completes.
         
-        self._release_capture()
+        # Do NOT call self._release_capture() here.
+        # It is handled in run() finally block (if graceful)
+        # or we risk race conditions/deadlocks if we touch cv2 from main thread.
 
     def _release_capture(self) -> None:
         """Release webcam resource if acquired."""
@@ -643,16 +650,18 @@ class AmbientLightMonitor(QThread):
 
         # Try v4l2src with common video devices (works on RPi 5 with CSI cameras)
         # Probe video0-7 as these are typically CSI camera interfaces
-        for idx in range(8):
-            device = f"/dev/video{idx}"
-            if os.path.exists(device):
-                pipelines.append(
-                    (
-                        f"v4l2src-{idx}",
-                        f"v4l2src device={device} ! video/x-raw,width=640,height=480 "
-                        f"! videoconvert ! video/x-raw,format=BGR ! appsink drop=true",
+        # SKIP v4l2src on Pi 5 to avoid crashes - rely on libcamerasrc or Picamera2
+        if not self._is_pi_5:
+            for idx in range(8):
+                device = f"/dev/video{idx}"
+                if os.path.exists(device):
+                    pipelines.append(
+                        (
+                            f"v4l2src-{idx}",
+                            f"v4l2src device={device} ! video/x-raw,width=640,height=480 "
+                            f"! videoconvert ! video/x-raw,format=BGR ! appsink drop=true",
+                        )
                     )
-                )
 
         # Legacy pipeline for older Raspberry Pi distributions with rpicamsrc.
         pipelines.append(

@@ -190,7 +190,7 @@ class NDotClockSlider(QWidget):
         
         # Initialize Brightness Manager
         self.brightness_manager = BrightnessManager(self, self.settings_manager.default_settings)
-        self.brightness_manager.configure(settings)
+        self._initial_settings = settings  # Store for lazy initialization
         self.brightness_manager.brightness_changed.connect(self._on_brightness_changed)
         self.brightness_manager.error_occurred.connect(
             lambda msg: self.show_notification(msg, notification_type="error")
@@ -398,16 +398,8 @@ class NDotClockSlider(QWidget):
         self.panel_scale_animation = None
         self._panel_opacity = 0.0
 
-        # Webview Preload & Caching
-        # Preload all webview slides to ensure they are ready and cached
-        for slide in self.slides:
-            if slide['type'] == SlideType.WEBVIEW:
-                url = slide['data'].get('url')
-                if url:
-                    self.webview_manager.load_url(url)
-        
-        # Fix: Preload SVG weather icons in background for ARM optimization
-        self._preload_weather_icons()
+        # Perform heavy initialization lazily to unblock startup
+        QTimer.singleShot(100, self._perform_lazy_initialization)
 
         # Main timer - ARM-optimized with dynamic intervals
         # Start with 16ms for smooth animations, but will adjust dynamically
@@ -419,8 +411,27 @@ class NDotClockSlider(QWidget):
         self.weather_timer = QTimer(self)
         self.weather_timer.timeout.connect(self.fetch_weather)
         self.weather_timer.start(600000)  # 10 minutes
-        self.fetch_weather()
 
+
+
+    def _perform_lazy_initialization(self):
+        """Perform heavy initialization tasks after UI is shown."""
+        # 1. Configure Brightness Manager (starts camera if auto-brightness enabled)
+        if hasattr(self, '_initial_settings'):
+            self.brightness_manager.configure(self._initial_settings)
+            del self._initial_settings
+
+        # 2. Preload webviews (staggered)
+        # Stagger loading to prevent freezing
+        for i, slide in enumerate(self.slides):
+            if slide['type'] == SlideType.WEBVIEW:
+                url = slide['data'].get('url')
+                if url:
+                    # Stagger loading by 800ms each
+                    QTimer.singleShot(500 + (i * 800), lambda u=url: self.webview_manager.load_url(u))
+        
+        # 3. Fetch weather (delayed)
+        QTimer.singleShot(2000, self.fetch_weather)
 
     def _on_brightness_changed(self, value: float):
         """Handle brightness change signal."""
@@ -2586,7 +2597,12 @@ class NDotClockSlider(QWidget):
             center_y = self.height() / 2
             scaled_width = card_width * scale
             scaled_height = card_height * scale
-            card_x = center_x - scaled_width / 2
+            
+            # Fix: Apply displacement to position cards correctly relative to current focus
+            # This prevents all cards from stacking at the center during transitions
+            displacement = slide_base_x + offset_x
+            card_x = (center_x - scaled_width / 2) + displacement
+            
             card_y = center_y - scaled_height / 2 + offset_y
             card_width = scaled_width
             card_height = scaled_height
@@ -3143,8 +3159,16 @@ class NDotClockSlider(QWidget):
 
     def draw_slides_normal_mode(self, painter: QPainter):
         """Draw slides in normal viewing mode"""
+        viewport_left = -self.slide_container.offset_x
+        viewport_right = viewport_left + self.width()
+        
         for i, slide in enumerate(self.slides):
             x_offset = i * self.width()
+            
+            # Performance optimization: Culling off-screen slides
+            # Skip drawing if the slide is strictly outside the viewport
+            if x_offset + self.width() < viewport_left or x_offset > viewport_right:
+                continue
 
             painter.save()
             painter.translate(x_offset, 0)
@@ -3433,12 +3457,15 @@ class NDotClockSlider(QWidget):
         """Draw colon between hours and minutes - ARM optimized with lookup table"""
         # ARM optimization: Use pre-calculated breathing intensity from lookup table
         breathing_intensity = self._breathing_lookup[self._breathing_frame]
+        
+        # Use effective_brightness for stable rendering during software dimming
+        brightness = self.effective_brightness
 
         if self.colon_color.red() > max(self.colon_color.green(), self.colon_color.blue()):
             color = QColor(
-                int(self.colon_color.red() * self.user_brightness * breathing_intensity),
-                int(self.colon_color.green() * self.user_brightness * breathing_intensity),
-                int(self.colon_color.blue() * self.user_brightness * breathing_intensity)
+                int(self.colon_color.red() * brightness * breathing_intensity),
+                int(self.colon_color.green() * brightness * breathing_intensity),
+                int(self.colon_color.blue() * brightness * breathing_intensity)
             )
             dot_radius = (self.dot_size / 2) * (0.95 + 0.05 * breathing_intensity)
         else:
@@ -3452,9 +3479,12 @@ class NDotClockSlider(QWidget):
     def draw_glow_dot(self, painter: QPainter, x: float, y: float, radius: float,
                      color: QColor, *, with_highlight: bool = True):
         """ARM-optimized: Draw a glowing dot with full pixmap caching (матовый вид)"""
+        # Use effective_brightness to maintain cache stability
+        brightness = self.effective_brightness
+        
         # Round radius and color for cache key (10% buckets for brightness variations - better for ARM)
         radius_rounded = int(radius)
-        brightness_bucket = int(self.user_brightness * 10) / 10.0  # 10% increments - reduces cache misses
+        brightness_bucket = int(brightness * 10) / 10.0  # 10% increments - reduces cache misses
         r = int(color.red() * brightness_bucket)
         g = int(color.green() * brightness_bucket)
         b = int(color.blue() * brightness_bucket)
@@ -3473,7 +3503,7 @@ class NDotClockSlider(QWidget):
         is_red = color.red() > max(color.green(), color.blue()) * 1.2
 
         # Calculate maximum size needed for pixmap
-        if self.user_brightness > 0.3:
+        if brightness > 0.3:
             halo_radius = radius * 2.0 if is_red else radius * 1.6
         else:
             halo_radius = radius
@@ -3491,15 +3521,15 @@ class NDotClockSlider(QWidget):
         center_y = pixmap_size / 2
 
         base_color = QColor(color)
-        base_alpha = int(235 * self.user_brightness)
+        base_alpha = int(235 * brightness)
         base_color.setAlpha(base_alpha)
 
         # Halo
-        if self.user_brightness > 0.3:
+        if brightness > 0.3:
             if is_red:
-                halo_alpha = int(180 * self.user_brightness)
+                halo_alpha = int(180 * brightness)
             else:
-                halo_alpha = int(120 * self.user_brightness * 0.7)
+                halo_alpha = int(120 * brightness * 0.7)
 
             halo_gradient = QRadialGradient(QPointF(center_x, center_y), halo_radius)
             glow_color = QColor(base_color)
@@ -3812,39 +3842,6 @@ class NDotClockSlider(QWidget):
         desc_dict = weather_codes.get(code, {"RU": "Неизвестно", "EN": "Unknown", "UA": "Невідомо"})
         return desc_dict.get(self.current_language, desc_dict["EN"])
 
-    def _preload_weather_icons(self):
-        """Fix: Preload all weather SVG icons for ARM optimization"""
-        resources_dir = self.get_resource_dir("resources")
-        icon_names = [
-            "clear day.svg", "clear night.svg",
-            "partly cloudy day.svg", "partly cloudy night.svg",
-            "cloudy day.svg", "showers day.svg", "no data.svg"
-        ]
-
-        # Preload with typical size
-        preload_height = 80
-        for icon_name in icon_names:
-            icon_path = os.path.join(resources_dir, icon_name)
-            if os.path.exists(icon_path):
-                try:
-                    svg_renderer = QSvgRenderer(icon_path)
-                    if svg_renderer.isValid():
-                        svg_size = svg_renderer.defaultSize()
-                        aspect_ratio = svg_size.width() / max(1, svg_size.height())
-                        icon_width = int(preload_height * aspect_ratio)
-
-                        pixmap = QPixmap(icon_width, preload_height)
-                        pixmap.fill(Qt.GlobalColor.transparent)
-                        pix_painter = QPainter(pixmap)
-                        pix_painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-                        svg_renderer.render(pix_painter, QRectF(0, 0, icon_width, preload_height))
-                        pix_painter.end()
-
-                        # Cache with estimated code/day values
-                        # This preloads for first render, avoiding slowdown
-                except Exception:
-                    pass
-
     def get_weather_icon_name(self, code: int, is_day: int) -> str:
         """Get icon filename for weather code"""
         if code in [0, 1]:  # Clear / Mainly clear
@@ -4066,23 +4063,31 @@ class NDotClockSlider(QWidget):
         start_x = (self.width() - total_width) // 2
         y = self.height() - int(76 * self.scale_factor)
 
+        # Use cached colors if available, otherwise generate (lazy init)
+        if not hasattr(self, '_edit_active_dot_color'):
+            self._edit_active_dot_color = self._scale_color_by_brightness(QColor(255, 255, 255))
+            self._edit_inactive_dot_color = self._scale_color_by_brightness(QColor(70, 70, 70))
+
         radius = dot_height / 2
+        painter.setPen(Qt.PenStyle.NoPen)
+        
         for i in range(len(self.slides)):
             x = start_x + i * (dot_width + dot_spacing)
 
-            painter.setPen(Qt.PenStyle.NoPen)
             if i == self.current_slide:
-                dot_color = self._scale_color_by_brightness(QColor(255, 255, 255))
-                painter.setBrush(dot_color)
+                painter.setBrush(self._edit_active_dot_color)
             else:
-                dot_color = self._scale_color_by_brightness(QColor(70, 70, 70))
-                painter.setBrush(dot_color)
+                painter.setBrush(self._edit_inactive_dot_color)
 
             painter.drawRoundedRect(x, y, dot_width, dot_height, radius, radius)
 
     def draw_language_buttons(self, painter: QPainter):
         """Draw language selection buttons and update button"""
         layout = self._compute_language_control_layout()  # исправлено: унифицируем размеры и hit-box контролов
+
+        # Initialize cache if needed (lazy)
+        if not hasattr(self, '_edit_lang_active_bg'):
+             self._update_cached_colors()
 
         lang_font_size = self.get_ui_size(12, 10)
         painter.setFont(QFont(self.font_family, lang_font_size, QFont.Weight.Medium))
@@ -4091,37 +4096,33 @@ class NDotClockSlider(QWidget):
         for lang, rect in layout["language_rects"]:
             painter.setPen(Qt.PenStyle.NoPen)
             if lang == self.current_language:
-                btn_color = self._scale_color_by_brightness(QColor(255, 255, 255))
-                text_color = self._scale_color_by_brightness(QColor(35, 35, 35))
-                painter.setBrush(btn_color)
+                painter.setBrush(self._edit_lang_active_bg)
+                text_color = self._edit_lang_active_text
             else:
-                btn_color = self._scale_color_by_brightness(QColor(70, 70, 70))
-                text_color = self._scale_color_by_brightness(QColor(220, 220, 220))
-                painter.setBrush(btn_color)
+                painter.setBrush(self._edit_lang_inactive_bg)
+                text_color = self._edit_lang_inactive_text
+                
             painter.drawRoundedRect(rect, radius, radius)
             painter.setPen(text_color)
             painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, lang)
 
         update_rect = layout["update_rect"]
         painter.setPen(Qt.PenStyle.NoPen)
-        update_bg = self._scale_color_by_brightness(QColor(45, 45, 45))
-        painter.setBrush(update_bg)
+        painter.setBrush(self._edit_update_bg)
         painter.drawRoundedRect(update_rect, radius, radius)
-        update_text = self._scale_color_by_brightness(QColor(200, 200, 200))
-        painter.setPen(update_text)
+        painter.setPen(self._edit_update_text)
         painter.drawText(update_rect, Qt.AlignmentFlag.AlignCenter, f"UPDATE · v{__version__}")
 
         autostart_rect = layout["autostart_rect"]
         autostart_enabled = AutostartManager.get_autostart_status()
         painter.setPen(Qt.PenStyle.NoPen)
         if autostart_enabled:
-            btn_color = self._scale_color_by_brightness(QColor(60, 180, 100))
-            text_color = self._scale_color_by_brightness(QColor(255, 255, 255))
-            painter.setBrush(btn_color)
+            painter.setBrush(self._edit_autostart_active_bg)
+            text_color = self._edit_autostart_text
         else:
-            btn_color = self._scale_color_by_brightness(QColor(70, 70, 70))
-            text_color = self._scale_color_by_brightness(QColor(220, 220, 220))
-            painter.setBrush(btn_color)
+            painter.setBrush(self._edit_lang_inactive_bg)
+            text_color = self._edit_lang_inactive_text
+            
         painter.drawRoundedRect(autostart_rect, radius, radius)
         painter.setPen(text_color)
         painter.drawText(autostart_rect, Qt.AlignmentFlag.AlignCenter, self._tr("autostart_button"))
@@ -4146,9 +4147,15 @@ class NDotClockSlider(QWidget):
         self.settings_manager.save_settings(settings)
 
     def _scale_color_by_brightness(self, color: QColor) -> QColor:
-        """Масштабирует цвет по текущей яркости"""
+        """Scales color by current effective brightness"""
+        # Use effective_brightness to avoid fluctuations during software dimming
+        brightness = self.effective_brightness
+        
+        # Optimization: if brightness is 1.0, return copy without math
+        if brightness >= 0.999:
+            return QColor(color)
+            
         scaled = QColor(color)
-        brightness = self.brightness_manager.get_brightness()
         scaled.setRed(int(scaled.red() * brightness))
         scaled.setGreen(int(scaled.green() * brightness))
         scaled.setBlue(int(scaled.blue() * brightness))
@@ -4157,6 +4164,18 @@ class NDotClockSlider(QWidget):
     @property
     def user_brightness(self) -> float:
         # Возвращаем текущую системную яркость (учитывает авто-яркость и программные изменения)
+        return self.brightness_manager.get_brightness()
+
+    @property
+    def effective_brightness(self) -> float:
+        """
+        Effective brightness for rendering.
+        If software overlay is used (no system backlight), this returns 1.0 (max)
+        so that we render full-color elements and dim them via the overlay.
+        This prevents expensive cache thrashing during brightness animations.
+        """
+        if not self.brightness_manager.has_system_backlight:
+            return 1.0
         return self.brightness_manager.get_brightness()
 
     @user_brightness.setter
@@ -4281,34 +4300,52 @@ class NDotClockSlider(QWidget):
 
     def _update_cached_colors(self):
         """ARM-optimized: Update color cache with smart invalidation"""
-        brightness = self.brightness_manager.get_brightness()
+        # Use effective_brightness to avoid cache thrashing when using software overlay
+        brightness = self.effective_brightness
         
-        # If using software overlay (no hardware backlight), keep colors bright
-        # and let the overlay handle dimming
-        if not self.brightness_manager.has_system_backlight:
-            brightness = 1.0
-        
+        # Calculate new colors
         digit_scaled = QColor(self._digit_color)
         digit_scaled.setRed(int(digit_scaled.red() * brightness))
         digit_scaled.setGreen(int(digit_scaled.green() * brightness))
         digit_scaled.setBlue(int(digit_scaled.blue() * brightness))
-        self._digit_color_scaled = digit_scaled
+        
+        # Only clear cache if colors actually changed
+        # This prevents clearing cache every frame during software brightness animations
+        edit_colors_missing = not hasattr(self, '_edit_lang_active_bg')
+        if digit_scaled != self._digit_color_scaled or edit_colors_missing:
+            self._digit_color_scaled = digit_scaled
 
-        colon_scaled = QColor(self._colon_color)
-        colon_scaled.setRed(int(colon_scaled.red() * brightness))
-        colon_scaled.setGreen(int(colon_scaled.green() * brightness))
-        colon_scaled.setBlue(int(colon_scaled.blue() * brightness))
-        self._colon_color_scaled = colon_scaled
+            colon_scaled = QColor(self._colon_color)
+            colon_scaled.setRed(int(colon_scaled.red() * brightness))
+            colon_scaled.setGreen(int(colon_scaled.green() * brightness))
+            colon_scaled.setBlue(int(colon_scaled.blue() * brightness))
+            self._colon_color_scaled = colon_scaled
 
-        date_color = QColor(self._digit_color)
-        date_color.setRed(int(date_color.red() * brightness * 0.6))
-        date_color.setGreen(int(date_color.green() * brightness * 0.6))
-        date_color.setBlue(int(date_color.blue() * brightness * 0.6))
-        self._date_color = date_color
+            date_color = QColor(self._digit_color)
+            date_color.setRed(int(date_color.red() * brightness * 0.6))
+            date_color.setGreen(int(date_color.green() * brightness * 0.6))
+            date_color.setBlue(int(date_color.blue() * brightness * 0.6))
+            self._date_color = date_color
 
-        # ARM optimization: Clear only digit pixmap cache, not glow dots (they use brightness buckets)
-        self._dot_pixmap_cache.clear()
-        # Note: _glow_dot_cache uses brightness buckets so it doesn't need to be cleared
+            # ARM optimization: Clear only digit pixmap cache, not glow dots (they use brightness buckets)
+            self._dot_pixmap_cache.clear()
+            # Note: _glow_dot_cache uses brightness buckets so it doesn't need to be cleared
+
+            # Update edit mode cached colors
+            self._edit_active_dot_color = self._scale_color_by_brightness(QColor(255, 255, 255))
+            self._edit_inactive_dot_color = self._scale_color_by_brightness(QColor(70, 70, 70))
+            
+            # Cache language button colors
+            self._edit_lang_active_bg = self._scale_color_by_brightness(QColor(255, 255, 255))
+            self._edit_lang_active_text = self._scale_color_by_brightness(QColor(35, 35, 35))
+            self._edit_lang_inactive_bg = self._scale_color_by_brightness(QColor(70, 70, 70))
+            self._edit_lang_inactive_text = self._scale_color_by_brightness(QColor(220, 220, 220))
+            self._edit_update_bg = self._scale_color_by_brightness(QColor(45, 45, 45))
+            self._edit_update_text = self._scale_color_by_brightness(QColor(200, 200, 200))
+            self._edit_autostart_active_bg = self._scale_color_by_brightness(QColor(60, 180, 100))
+            self._edit_autostart_text = self._scale_color_by_brightness(QColor(255, 255, 255))
+
+
 
     def closeEvent(self, event):
         """Handle window close"""

@@ -189,6 +189,10 @@ class BrightnessManager(QObject):
         self._ambient_dynamic_max: Optional[float] = None
         self._ambient_calibration_last_log: Optional[Tuple[float, float]] = None
         self._auto_brightness_has_sample = False
+        
+        # Fix: Track stopping monitors to prevent race conditions
+        self._stopping_monitors: set[QObject] = set()
+        self._pending_enable = False
 
     def configure(self, settings: dict):
         """Update configuration from settings dictionary."""
@@ -302,43 +306,90 @@ class BrightnessManager(QObject):
         if enabled:
             # Reset reconnect counter when manually enabling
             self._reconnect_attempts = 0
-            
-            if not self._ambient_light_monitor:
-                if self._auto_brightness_verbose:
-                    print("[AutoBrightness] Starting ambient light monitor...", file=sys.stderr, flush=True)
-                
-                interval = self._auto_brightness_interval_override or self._auto_brightness_interval_ms
-                self._ambient_light_monitor = AmbientLightMonitor(
-                    camera_index=self._auto_brightness_camera_index,
-                    interval_ms=interval,
-                    parent=self
-                )
-                self._ambient_light_monitor.brightnessMeasured.connect(self._on_ambient_brightness_measured)
-                self._ambient_light_monitor.errorOccurred.connect(self._on_ambient_light_error)
-                self._ambient_light_monitor.cameraIndexResolved.connect(self._on_auto_brightness_camera_resolved)
-                self._ambient_light_monitor.start()
-                
-                # Reset smoothing state
-                self._auto_brightness_smoothed = self._current_display_brightness
-                self._ambient_brightness_buffer.clear()
-                self._auto_brightness_has_sample = False
+            self._try_start_auto_brightness()
         else:
             # Stop reconnect timer and reset counter
             self._stop_reconnect_timer()
             self._reconnect_attempts = 0
+            self._pending_enable = False
             
             self._teardown_ambient_monitor()
             # Animate back to manual brightness
             self._apply_brightness(self._manual_brightness, from_auto=False)
+
+    def _try_start_auto_brightness(self):
+        """Attempt to start auto brightness, waiting for teardown if needed."""
+        if not self._auto_brightness_enabled:
+            return
+
+        # If there are any stopping monitors, wait for them to finish
+        if self._stopping_monitors:
+            if self._auto_brightness_verbose:
+                print("[AutoBrightness] Waiting for previous monitor(s) to stop...", file=sys.stderr, flush=True)
+            self._pending_enable = True
+            return
+            
+        self._pending_enable = False
+        
+        if not self._ambient_light_monitor:
+            if self._auto_brightness_verbose:
+                print("[AutoBrightness] Starting ambient light monitor...", file=sys.stderr, flush=True)
+            
+            interval = self._auto_brightness_interval_override or self._auto_brightness_interval_ms
+            self._ambient_light_monitor = AmbientLightMonitor(
+                camera_index=self._auto_brightness_camera_index,
+                interval_ms=interval,
+                parent=self
+            )
+            self._ambient_light_monitor.brightnessMeasured.connect(self._on_ambient_brightness_measured)
+            self._ambient_light_monitor.errorOccurred.connect(self._on_ambient_light_error)
+            self._ambient_light_monitor.cameraIndexResolved.connect(self._on_auto_brightness_camera_resolved)
+            self._ambient_light_monitor.start()
+            
+            # Reset smoothing state
+            self._auto_brightness_smoothed = self._current_display_brightness
+            self._ambient_brightness_buffer.clear()
+            self._auto_brightness_has_sample = False
 
     def _teardown_ambient_monitor(self):
         """Stop and cleanup ambient light monitor."""
         if self._ambient_light_monitor:
             if self._auto_brightness_verbose:
                 print("[AutoBrightness] Stopping ambient light monitor...", file=sys.stderr, flush=True)
-            self._ambient_light_monitor.stop()
-            self._ambient_light_monitor.deleteLater()
+            
+            monitor = self._ambient_light_monitor
+            # Clear reference immediately to prevent reuse
             self._ambient_light_monitor = None
+            
+            # Track this monitor as stopping
+            self._stopping_monitors.add(monitor)
+            
+            # Disconnect signals first to stop updates
+            try:
+                monitor.brightnessMeasured.disconnect()
+                monitor.errorOccurred.disconnect()
+                monitor.cameraIndexResolved.disconnect()
+            except Exception:
+                pass
+
+            # Request stop (non-blocking/short-blocking)
+            monitor.stop()
+            
+            def on_monitor_finished():
+                if monitor in self._stopping_monitors:
+                    self._stopping_monitors.remove(monitor)
+                monitor.deleteLater()
+                
+                # If we were waiting to enable, try now
+                if self._pending_enable and not self._stopping_monitors:
+                    self._try_start_auto_brightness()
+
+            if monitor.isRunning():
+                # If thread is still running (background shutdown), let it delete itself when finished
+                monitor.finished.connect(on_monitor_finished)
+            else:
+                # If already finished, delete now
+                on_monitor_finished()
 
     def _on_ambient_brightness_measured(self, ambient: float):
         """Handle new ambient brightness measurement."""
