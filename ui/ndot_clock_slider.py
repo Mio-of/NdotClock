@@ -82,6 +82,7 @@ from ui.popups import ConfirmationPopup, DownloadProgressPopup, NotificationPopu
 from ui.brightness import BrightnessManager
 from ui.webviews import WebviewManager
 from ui.settings_manager import SettingsManager
+from ui.task_queue import TaskQueue
 
 
 class BrightnessOverlay(QWidget):
@@ -135,20 +136,14 @@ class NDotClockSlider(QWidget):
 
     @staticmethod
     def get_config_dir():
-        """Get platform-specific user config directory for settings"""
-        app_name = "Ndot Clock"
-
-        if sys.platform == 'win32':
-            # Windows: %APPDATA%\Ndot Clock
-            config_dir = os.path.join(os.environ.get('APPDATA', ''), app_name)
-        elif sys.platform == 'darwin':
-            # macOS: ~/Library/Application Support/Ndot Clock
-            config_dir = os.path.join(os.path.expanduser('~'), 'Library', 'Application Support', app_name)
+        """Get config directory inside resources folder for portability"""
+        # Use the same logic as get_resource_dir to find the correct path
+        if getattr(sys, 'frozen', False):
+            base_path = sys._MEIPASS
         else:
-            # Linux/Unix: ~/.config/ndot_clock
-            config_dir = os.path.join(os.path.expanduser('~'), '.config', app_name)
-
-        # Create directory if it doesn't exist
+            base_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            
+        config_dir = os.path.join(base_path, 'resources')
         os.makedirs(config_dir, exist_ok=True)
         return config_dir
 
@@ -200,6 +195,9 @@ class NDotClockSlider(QWidget):
         # Initialize Webview Manager
         self.scale_factor = 1.0  # ensure available for dependent components
         self.webview_manager = WebviewManager(self)
+        
+        # Initialize Task Queue for lazy initialization
+        self.task_queue = TaskQueue(self)
         
         # Derived settings
         self._digit_color_scaled = QColor(self._digit_color)
@@ -317,7 +315,7 @@ class NDotClockSlider(QWidget):
         self._home_assistant_error_message = ""
         self._home_assistant_error_notified = False
         self._home_assistant_last_url = ""
-        self.is_fullscreen = False  # Track fullscreen state
+        # Note: is_fullscreen is loaded from settings earlier in __init__
 
         # Mouse state for long press and dragging
         self.mouse_pressed = False
@@ -400,6 +398,9 @@ class NDotClockSlider(QWidget):
 
         # Perform heavy initialization lazily to unblock startup
         QTimer.singleShot(100, self._perform_lazy_initialization)
+        
+        # Restore window state (fullscreen) shortly after startup
+        QTimer.singleShot(300, self._restore_window_state)
 
         # Main timer - ARM-optimized with dynamic intervals
         # Start with 16ms for smooth animations, but will adjust dynamically
@@ -415,23 +416,50 @@ class NDotClockSlider(QWidget):
 
 
     def _perform_lazy_initialization(self):
-        """Perform heavy initialization tasks after UI is shown."""
-        # 1. Configure Brightness Manager (starts camera if auto-brightness enabled)
-        if hasattr(self, '_initial_settings'):
-            self.brightness_manager.configure(self._initial_settings)
-            del self._initial_settings
+        """Perform heavy initialization tasks using TaskQueue to prevent UI freezes."""
+        
+        # 1. Configure Brightness Manager
+        # This might start the camera, so we do it first but safely
+        def init_brightness():
+            import sys
+            print(f"[InitBrightness] has _initial_settings: {hasattr(self, '_initial_settings')}", file=sys.stderr, flush=True)
+            if hasattr(self, '_initial_settings'):
+                print(f"[InitBrightness] auto_brightness_enabled = {self._initial_settings.get('auto_brightness_enabled')}", file=sys.stderr, flush=True)
+                self.brightness_manager.configure(self._initial_settings)
+                del self._initial_settings
+        
+        self.task_queue.add_task(init_brightness, "Init Brightness", delay_ms=100)
 
         # 2. Preload webviews (staggered)
-        # Stagger loading to prevent freezing
+        # We add each webview load as a separate task with delay
         for i, slide in enumerate(self.slides):
             if slide['type'] == SlideType.WEBVIEW:
                 url = slide['data'].get('url')
                 if url:
-                    # Stagger loading by 800ms each
-                    QTimer.singleShot(500 + (i * 800), lambda u=url: self.webview_manager.load_url(u))
+                    # Use a factory function to capture the variable properly
+                    def load_webview_task(u=url):
+                        self.webview_manager.load_url(u)
+                    
+                    # 800ms delay between heavy webview loads
+                    self.task_queue.add_task(load_webview_task, f"Load Webview {i}", delay_ms=800)
         
         # 3. Fetch weather (delayed)
-        QTimer.singleShot(2000, self.fetch_weather)
+        # Add weather fetch as a task with a larger delay after webviews
+        self.task_queue.add_task(self.fetch_weather, "Fetch Weather", delay_ms=1500)
+        
+        # Start the queue
+        self.task_queue.start()
+
+    def _restore_window_state(self):
+        """Restore window state (fullscreen/geometry) independent of loading queue."""
+        print(f"[RestoreWindowState] is_fullscreen = {self.is_fullscreen}")
+        if self.is_fullscreen:
+            print("[RestoreWindowState] Calling showFullScreen()")
+            self.showFullScreen()
+            self.setFocus(Qt.FocusReason.OtherFocusReason)
+        else:
+            # Restore position if needed
+            pass
 
     def _on_brightness_changed(self, value: float):
         """Handle brightness change signal."""
@@ -1029,8 +1057,7 @@ class NDotClockSlider(QWidget):
     def handle_weather_response(self, reply: QNetworkReply):
         """Handle weather API response"""
         try:
-            self.weather_loading = False
-
+            # Don't set loading=False yet, wait for parser
             if reply.error() == QNetworkReply.NetworkError.NoError:
                 try:
                     response_data = bytes(reply.readAll()).decode()
@@ -1043,11 +1070,16 @@ class NDotClockSlider(QWidget):
                     self.weather_parser_thread.finished.connect(self._on_weather_parsed)
                     self.weather_parser_thread.error.connect(self._on_json_parse_error)
                     self.weather_parser_thread.start()
+                    
+                    # Loading continues in thread...
+                    return 
 
                 except Exception as e:
+                    self.weather_loading = False
                     self.weather_status_message = f"Weather error: {str(e)}"
                     self.update()
             else:
+                self.weather_loading = False
                 self.weather_status_message = f"Weather failed: {reply.errorString()}"
                 self.update()
         finally:
@@ -1058,6 +1090,8 @@ class NDotClockSlider(QWidget):
         if data_type != 'weather':
             return
 
+        self.weather_loading = False  # Parsing finished
+        
         current = data.get('current', {})
 
         temp = current.get('temperature_2m', 0)
@@ -1077,8 +1111,10 @@ class NDotClockSlider(QWidget):
     def _on_json_parse_error(self, error_message: str, data_type: str):
         """Handle JSON parse errors"""
         if data_type == 'location':
+            self.location_loading = False
             self.weather_status_message = f"Location parse error: {error_message}"
         elif data_type == 'weather':
+            self.weather_loading = False
             self.weather_status_message = f"Weather parse error: {error_message}"
             self.update()
 
@@ -3646,6 +3682,19 @@ class NDotClockSlider(QWidget):
         
         painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._tr("loading_weather"))
 
+    def draw_weather_error(self, painter: QPainter, message: str):
+        """Draw error state for weather slide"""
+        content_height = int(self.height() * 0.7)
+        font_size = max(12, int(content_height * 0.06))
+        font = self._get_cached_font(self.font_family, font_size)
+        
+        color = self._scale_color_by_brightness(QColor(255, 100, 100))
+        painter.setPen(color)
+        painter.setFont(font)
+        
+        rect = self.rect().adjusted(20, 20, -20, -20)
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, message)
+
     def _get_or_create_weather_icon(self, code: int, is_day: int, height: int) -> Optional[QPixmap]:
         """Get weather icon from cache or create it"""
         cache_key = (code, is_day, height)
@@ -4351,6 +4400,9 @@ class NDotClockSlider(QWidget):
     def closeEvent(self, event):
         """Handle window close"""
         try:
+            # FIRST: Save settings before any cleanup that might fail
+            self.save_settings()
+            
             # Fix: Graceful cleanup to prevent crashes on exit
             self._cleanup_panel_animations()
             if hasattr(self, 'edit_panel') and self.edit_panel:
@@ -4383,10 +4435,8 @@ class NDotClockSlider(QWidget):
             # Clean up brightness manager (stops ambient light monitor thread)
             if hasattr(self, 'brightness_manager') and self.brightness_manager:
                 self.brightness_manager.cleanup()
-            
-            self.save_settings()
-        except Exception:
-            pass  # Игнорируем ошибки при закрытии
+        except Exception as e:
+            print(f"[CloseEvent] Error during cleanup: {e}")  # Log for debugging
         finally:
             super().closeEvent(event)
 

@@ -1,7 +1,7 @@
 import os
 from typing import Optional, Dict, Tuple
-from PyQt6.QtCore import QObject, QTimer, QUrl, QRectF, Qt, pyqtSignal
-from PyQt6.QtGui import QPixmap, QPainter, QColor
+from PyQt6.QtCore import QObject, QUrl, QRectF, Qt, pyqtSignal
+from PyQt6.QtGui import QPixmap, QPainter
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PyQt6.QtSvg import QSvgRenderer
 
@@ -353,17 +353,17 @@ class WeatherManager(QObject):
 
         icon_path = self.get_weather_icon_path(code, is_day)
         if not os.path.exists(icon_path):
-             return QPixmap()
+            return QPixmap()
 
         renderer = QSvgRenderer(icon_path)
         if not renderer.isValid():
-             return QPixmap()
-             
+            return QPixmap()
+
         # Calculate aspect ratio to prevent stretching
         svg_size = renderer.defaultSize()
         aspect_ratio = svg_size.width() / max(1, svg_size.height())
         width = int(size * aspect_ratio)
-             
+
         pixmap = QPixmap(width, size)
         pixmap.fill(Qt.GlobalColor.transparent)
         painter = QPainter(pixmap)

@@ -22,10 +22,17 @@ class BrightnessManager(QObject):
         # Configuration
         self._manual_brightness = self.default_settings.get('user_brightness', 0.8)
         self._auto_brightness_enabled = self.default_settings.get('auto_brightness_enabled', False)
-        self._auto_brightness_min = self.default_settings.get('auto_brightness_min', 0.0)
-        self._auto_brightness_max = self.default_settings.get('auto_brightness_max', 1.0)
+        self._auto_brightness_min = self.default_settings.get('auto_brightness_min', 0.15)  # Screen brightness min
+        self._auto_brightness_max = self.default_settings.get('auto_brightness_max', 1.0)   # Screen brightness max
         self._auto_brightness_camera_index = self.default_settings.get('auto_brightness_camera', 0)
         self._auto_brightness_interval_ms = self.default_settings.get('auto_brightness_interval_ms', 1000)
+        
+        # Camera calibration (ambient light range from camera)
+        # These define what the camera reports for dark vs bright conditions
+        # Use calibrate_camera.py to determine these values for your setup
+        self._camera_ambient_min = self.default_settings.get('camera_ambient_min', 0.11)  # Camera value in darkness (covered)
+        self._camera_ambient_max = self.default_settings.get('camera_ambient_max', 0.42)  # Camera value with bright light
+        self._camera_ambient_darkroom = self.default_settings.get('camera_ambient_darkroom', None)  # Dark room (lights off)
         
         # State
         self._auto_brightness_smoothed = self._manual_brightness
@@ -174,6 +181,42 @@ class BrightnessManager(QObject):
                 self._auto_brightness_max_override, self._auto_brightness_min_override
             )
 
+        # Camera calibration overrides (from calibrate_camera.py results)
+        self._camera_ambient_min_override: Optional[float] = None
+        self._camera_ambient_max_override: Optional[float] = None
+        self._camera_ambient_darkroom_override: Optional[float] = None
+        
+        cam_min_env = os.environ.get("NDOT_CAMERA_AMBIENT_MIN", "").strip()
+        cam_max_env = os.environ.get("NDOT_CAMERA_AMBIENT_MAX", "").strip()
+        cam_darkroom_env = os.environ.get("NDOT_CAMERA_AMBIENT_DARKROOM", "").strip()
+        
+        if cam_min_env:
+            try:
+                self._camera_ambient_min_override = max(0.0, min(float(cam_min_env), 1.0))
+                if self._auto_brightness_verbose:
+                    print(f"[AutoBrightness] NDOT_CAMERA_AMBIENT_MIN={self._camera_ambient_min_override:.3f}", file=sys.stderr, flush=True)
+            except ValueError:
+                if self._auto_brightness_verbose:
+                    print(f"[AutoBrightness] Invalid NDOT_CAMERA_AMBIENT_MIN='{cam_min_env}', ignoring", file=sys.stderr, flush=True)
+        
+        if cam_max_env:
+            try:
+                self._camera_ambient_max_override = max(0.0, min(float(cam_max_env), 1.0))
+                if self._auto_brightness_verbose:
+                    print(f"[AutoBrightness] NDOT_CAMERA_AMBIENT_MAX={self._camera_ambient_max_override:.3f}", file=sys.stderr, flush=True)
+            except ValueError:
+                if self._auto_brightness_verbose:
+                    print(f"[AutoBrightness] Invalid NDOT_CAMERA_AMBIENT_MAX='{cam_max_env}', ignoring", file=sys.stderr, flush=True)
+        
+        if cam_darkroom_env:
+            try:
+                self._camera_ambient_darkroom_override = max(0.0, min(float(cam_darkroom_env), 1.0))
+                if self._auto_brightness_verbose:
+                    print(f"[AutoBrightness] NDOT_CAMERA_AMBIENT_DARKROOM={self._camera_ambient_darkroom_override:.3f}", file=sys.stderr, flush=True)
+            except ValueError:
+                if self._auto_brightness_verbose:
+                    print(f"[AutoBrightness] Invalid NDOT_CAMERA_AMBIENT_DARKROOM='{cam_darkroom_env}', ignoring", file=sys.stderr, flush=True)
+
         # Calibration decay
         calibration_decay_env = os.environ.get("NDOT_AUTO_BRIGHTNESS_CALIBRATION_DECAY", "").strip()
         self._ambient_calibration_decay = 0.005
@@ -196,10 +239,12 @@ class BrightnessManager(QObject):
 
     def configure(self, settings: dict):
         """Update configuration from settings dictionary."""
+        print(f"[BrightnessManager.configure] Called with auto_brightness_enabled={settings.get('auto_brightness_enabled')}", file=sys.stderr, flush=True)
         self._manual_brightness = float(settings.get('user_brightness', self._manual_brightness))
         self._manual_brightness = max(0.0, min(1.0, self._manual_brightness))
         
         new_enabled = bool(settings.get('auto_brightness_enabled', self._auto_brightness_enabled))
+        print(f"[BrightnessManager.configure] new_enabled={new_enabled}, current={self._auto_brightness_enabled}", file=sys.stderr, flush=True)
         
         self._auto_brightness_camera_index = int(settings.get('auto_brightness_camera', self._auto_brightness_camera_index))
         
@@ -297,8 +342,12 @@ class BrightnessManager(QObject):
 
     def set_auto_brightness_enabled(self, enabled: bool, user_triggered: bool = False):
         """Enable or disable auto-brightness."""
+        # Skip if state unchanged AND monitor is already running (or not needed)
+        monitor_running = self._ambient_light_monitor is not None
         if self._auto_brightness_enabled == enabled and not user_triggered:
-            return
+            # If enabling and monitor not running, we still need to start it
+            if not (enabled and not monitor_running):
+                return
 
         self._auto_brightness_enabled = enabled
         self.auto_brightness_toggled.emit(enabled)
@@ -439,8 +488,8 @@ class BrightnessManager(QObject):
                 (1.0 - self._auto_brightness_smoothing) * target_brightness
             )
             
-        # Apply brightness
-        self._apply_brightness(self._auto_brightness_smoothed, from_auto=True)
+        # Apply brightness directly without animation (auto-brightness updates frequently)
+        self._apply_brightness(self._auto_brightness_smoothed, from_auto=True, animate=False)
         
         # Logging
         if self._auto_brightness_verbose:
@@ -450,26 +499,43 @@ class BrightnessManager(QObject):
                 print(f"[AutoBrightness] Ambient={avg_ambient:.4f} (raw={ambient:.4f}) -> Target={target_brightness:.4f} -> Smoothed={self._auto_brightness_smoothed:.4f}", file=sys.stderr, flush=True)
 
     def _map_ambient_to_user_brightness(self, ambient: float) -> float:
-        """Map ambient light level (0.0-1.0) to screen brightness (0.0-1.0)."""
-        # Normalize ambient based on dynamic range
-        if self._ambient_dynamic_max is None or self._ambient_dynamic_min is None:
-            normalized = ambient
-        else:
-            denom = self._ambient_dynamic_max - self._ambient_dynamic_min
-            if denom < 0.0001:
-                normalized = 0.5
-            else:
-                normalized = (ambient - self._ambient_dynamic_min) / denom
-                normalized = max(0.0, min(1.0, normalized))
-                
-        # Apply gamma curve
-        curved = math.pow(normalized, 1.0 / self._auto_brightness_curve_gamma)
+        """Map ambient light level to screen brightness.
         
-        # Apply min/max constraints
+        Uses camera calibration values to normalize the ambient reading,
+        then maps to screen brightness range.
+        
+        Camera range (e.g., 0.11-0.42) -> Screen range (e.g., 0.15-1.0)
+        
+        If darkroom calibration is available, use it as the effective minimum
+        for typical usage (more realistic than camera covered).
+        """
+        # Get camera calibration values (can be overridden via env vars)
+        cam_min = self._camera_ambient_min_override if self._camera_ambient_min_override is not None else self._camera_ambient_min
+        cam_max = self._camera_ambient_max_override if self._camera_ambient_max_override is not None else self._camera_ambient_max
+        
+        # Use darkroom as effective minimum if available (more realistic than covered camera)
+        cam_darkroom = self._camera_ambient_darkroom_override if self._camera_ambient_darkroom_override is not None else self._camera_ambient_darkroom
+        if cam_darkroom is not None:
+            # Use darkroom for typical mapping, but allow going below for extreme darkness
+            effective_min = cam_darkroom
+        else:
+            effective_min = cam_min
+        
+        # Normalize ambient based on camera's calibrated range
+        cam_range = cam_max - effective_min
+        if cam_range < 0.01:
+            cam_range = 0.01  # Prevent division by zero
+        
+        # Map camera value to 0.0-1.0 range
+        normalized = (ambient - effective_min) / cam_range
+        normalized = max(0.0, min(1.0, normalized))
+        
+        # Get screen brightness range
         min_b = self._auto_brightness_min_override if self._auto_brightness_min_override is not None else self._auto_brightness_min
         max_b = self._auto_brightness_max_override if self._auto_brightness_max_override is not None else self._auto_brightness_max
         
-        return min_b + (max_b - min_b) * curved
+        # Map to screen brightness range
+        return min_b + (max_b - min_b) * normalized
 
     def _on_ambient_light_error(self, error_code: str):
         """Handle ambient light monitor errors."""
@@ -606,21 +672,20 @@ class BrightnessManager(QObject):
             return
             
         try:
-            # Apply gamma for better perception
-            perceptual_value = math.pow(value, 2.2)
-            
-            # Ensure we don't go below 15% for hardware backlight to prevent black screen
-            perceptual_value = max(0.15, perceptual_value)
+            # Pass value directly to backlight (linear mapping)
+            # Note: Removed gamma 2.2 correction which was too aggressive for low values
+            # and caused auto-brightness to always hit the 15% floor
+            backlight_value = max(0.15, value)
             
             # Log if changed significantly
             if (self._system_backlight_last_ui_log is None or 
                 abs(self._system_backlight_last_ui_log - value) > 0.05):
                 if self._system_backlight_verbose:
-                    print(f"[Backlight] Setting system brightness: {value:.2f} (perceptual: {perceptual_value:.2f})", file=sys.stderr, flush=True)
+                    print(f"[Backlight] Setting system brightness: {value:.2f} -> {backlight_value:.2f}", file=sys.stderr, flush=True)
                 self._system_backlight_last_ui_log = value
                 
             # Use set_level() which accepts 0.0-1.0 and handles conversion internally
-            self._system_backlight.set_level(perceptual_value)
+            self._system_backlight.set_level(backlight_value)
             
         except Exception as e:
             if self._system_backlight_verbose:

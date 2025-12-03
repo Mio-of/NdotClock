@@ -294,3 +294,4 @@ class WebviewManager:
             self.profile = None
         
         self._last_mask_size = None
+        self._last_geometry = None

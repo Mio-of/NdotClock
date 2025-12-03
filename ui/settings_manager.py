@@ -28,15 +28,21 @@ class SettingsManager:
         """Load and validate settings, returning a dictionary with native types"""
         settings = self.default_settings.copy()
         
+        print(f"[SettingsManager] Loading from: {self.settings_file}")
+        print(f"[SettingsManager] File exists: {os.path.exists(self.settings_file)}")
+        
         if os.path.exists(self.settings_file):
             try:
                 with open(self.settings_file, 'r', encoding='utf-8') as f:
                     loaded = json.load(f)
+                    print(f"[SettingsManager] Loaded JSON keys: {list(loaded.keys())}")
+                    print(f"[SettingsManager] fullscreen in file: {loaded.get('fullscreen')}")
+                    print(f"[SettingsManager] auto_brightness_enabled in file: {loaded.get('auto_brightness_enabled')}")
                     # Update only keys that exist in loaded settings to preserve defaults
                     # But here we want to override defaults with loaded values
                     settings.update(loaded)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[SettingsManager] Error loading settings: {e}")
 
         # Validate and convert types
         validated = {}
