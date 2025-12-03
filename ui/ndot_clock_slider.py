@@ -45,6 +45,7 @@ from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile, QWebEngineSettings
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QColorDialog,
     QFrame,
@@ -2655,6 +2656,10 @@ class NDotClockSlider(QWidget):
             self.webview_manager.webview.isVisible()):
             
             webview = self.webview_manager.webview
+            
+            # Let touch events pass through for native scrolling (two-finger scroll)
+            if event.type() in (QEvent.Type.TouchBegin, QEvent.Type.TouchUpdate, QEvent.Type.TouchEnd):
+                return False  # Don't intercept - let webview handle natively
             
             if event.type() == QEvent.Type.MouseButtonPress:
                 self._webview_mouse_start = event.pos()

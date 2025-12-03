@@ -151,10 +151,16 @@ class WebviewManager:
         settings.setAttribute(QWebEngineSettings.WebAttribute.Accelerated2dCanvasEnabled, True)
         settings.setAttribute(QWebEngineSettings.WebAttribute.WebGLEnabled, True)
         settings.setAttribute(QWebEngineSettings.WebAttribute.ScrollAnimatorEnabled, True)
+        # Enable touch scrolling
+        if hasattr(QWebEngineSettings.WebAttribute, 'TouchIconsEnabled'):
+            settings.setAttribute(QWebEngineSettings.WebAttribute.TouchIconsEnabled, True)
 
         view.page().setBackgroundColor(QColor(255, 255, 255))
         view.installEventFilter(self.parent)
         view.setAttribute(Qt.WidgetAttribute.WA_AcceptTouchEvents, True)
+        # Ensure child widget (focusProxy) also accepts touch events
+        if view.focusProxy():
+            view.focusProxy().setAttribute(Qt.WidgetAttribute.WA_AcceptTouchEvents, True)
         
         border_radius = self._border_radius_px()
         view.setStyleSheet(f"QWebEngineView {{ border-radius: {border_radius}px; background: white; }}")
