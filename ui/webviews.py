@@ -134,9 +134,11 @@ class WebviewManager:
         view._url_key = url_key
 
         view.setUpdatesEnabled(False)
-        # Start off-screen
+        # Start off-screen (don't call show() - it can break parent fullscreen on some WMs)
         view.setGeometry(-10000, -10000, 800, 600)
-        view.show()
+        view.setVisible(True)
+        view.lower()  # Keep behind other widgets
+        view.setUpdatesEnabled(True)
 
         view.loadFinished.connect(lambda success: self.on_webview_load_finished(view, success))
 
@@ -272,6 +274,11 @@ class WebviewManager:
             view.error_message = "Failed to load page"
             view.page_loaded = False
             self._hide_view_instance(view)
+        
+        # Fix: Re-apply fullscreen if it was lost (some WMs break it when webviews load)
+        if hasattr(self.parent, 'is_fullscreen') and self.parent.is_fullscreen:
+            if not self.parent.isFullScreen():
+                self.parent.showFullScreen()
             
         # Only notify parent if this is the current view
         if self.webview == view:
