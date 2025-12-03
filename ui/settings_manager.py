@@ -21,6 +21,7 @@ class SettingsManager:
             'auto_brightness_interval_ms': 1000,
             'auto_brightness_min': 0.0,
             'auto_brightness_max': 1.0,
+            'window_position': {'x': 100, 'y': 100},
         }
 
     def load_settings(self) -> Dict[str, Any]:
@@ -64,18 +65,30 @@ class SettingsManager:
         validated['language'] = settings.get('language', 'RU')
         validated['fullscreen'] = settings.get('fullscreen', False)
         validated['location'] = settings.get('location', {'lat': None, 'lon': None})
+        validated['window_position'] = settings.get('window_position', {'x': 100, 'y': 100})
         
         # Slides
         slides_data = settings.get('slides', [])
         validated_slides = []
         for s in slides_data:
             try:
-                validated_slides.append({
-                    'type': SlideType(s['type']),
-                    'data': s.get('data', {})
-                })
+                slide_type = SlideType(s['type'])
+                # Skip ADD slides from saved data - we'll add it at the end
+                if slide_type != SlideType.ADD:
+                    validated_slides.append({
+                        'type': slide_type,
+                        'data': s.get('data', {})
+                    })
             except (ValueError, KeyError):
                 continue
+        
+        # If no slides, add default clock slide
+        if not validated_slides:
+            validated_slides = [{'type': SlideType.CLOCK, 'data': {}}]
+        
+        # Always add ADD slide at the end
+        validated_slides.append({'type': SlideType.ADD, 'data': {}})
+            
         validated['slides'] = validated_slides
         
         return validated
@@ -97,11 +110,12 @@ class SettingsManager:
             c = serializable['colon_color']
             serializable['colon_color'] = (c.red(), c.green(), c.blue())
             
-        # Convert slides
+        # Convert slides (exclude ADD slides - they're added automatically)
         if 'slides' in serializable:
             serializable['slides'] = [
                 {'type': s['type'].value, 'data': s['data']} 
                 for s in serializable['slides']
+                if s['type'] != SlideType.ADD
             ]
             
         try:

@@ -1,7 +1,7 @@
 import os
 from typing import Optional
-from PyQt6.QtCore import QUrl, QTimer, Qt
-from PyQt6.QtGui import QColor
+from PyQt6.QtCore import QUrl, QTimer, Qt, QRectF
+from PyQt6.QtGui import QColor, QPainterPath, QRegion
 # Note: QGraphicsOpacityEffect removed - causes window recreation with WebEngine
 from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile, QWebEngineSettings
 from PyQt6.QtWebEngineWidgets import QWebEngineView
@@ -21,13 +21,53 @@ class SilentWebEnginePage(QWebEnginePage):
 class WebviewManager:
     def __init__(self, parent):
         self.parent = parent
-        self.webview: Optional[QWebEngineView] = None
-        self.profile: Optional[QWebEngineProfile] = None  # Fix: Keep profile reference
-        self.current_url = ""
-        self.page_loaded = False
-        self.error_message = ""
-        self.error_notified = False
-        self.load_timeout_timer: Optional[QTimer] = None
+        self.webviews: dict[str, QWebEngineView] = {}  # Cache: url -> view
+        self.current_key: Optional[str] = None
+        self.profile: Optional[QWebEngineProfile] = None
+        
+        # Cache geometry to avoid redundant updates
+        self._last_mask_size: Optional[tuple[int, int]] = None
+        self._last_geometry: Optional[tuple[int, int, int, int]] = None
+
+    @property
+    def webview(self) -> Optional[QWebEngineView]:
+        """Backwards compatibility: get current webview"""
+        return self.webviews.get(self.current_key) if self.current_key else None
+
+    @property
+    def page_loaded(self) -> bool:
+        """Backwards compatibility: get current page load status"""
+        view = self.webview
+        return getattr(view, 'page_loaded', False) if view else False
+
+    @property
+    def error_message(self) -> str:
+        """Backwards compatibility: get current error message"""
+        view = self.webview
+        return getattr(view, 'error_message', "") if view else ""
+        
+    @property
+    def current_url(self) -> str:
+        """Backwards compatibility: get current url key"""
+        return self.current_key if self.current_key else ""
+
+    def _border_radius_px(self) -> int:
+        scale = getattr(self.parent, 'scale_factor', 1.0) or 1.0
+        return max(8, int(12 * scale))
+
+    def _apply_mask(self, width: int, height: int):
+        view = self.webview
+        if not view or width <= 0 or height <= 0:
+            return
+        size_key = (width, height)
+        if size_key == self._last_mask_size:
+            return
+        self._last_mask_size = size_key
+        border_radius = self._border_radius_px()
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(0, 0, width, height), border_radius, border_radius)
+        region = QRegion(path.toFillPolygon().toPolygon())
+        view.setMask(region)
 
     def _prepare_url(self, raw_url: str, *, default_scheme: str = "https") -> Optional[QUrl]:
         """Normalize user-provided URL before loading it into webviews."""
@@ -44,178 +84,213 @@ class WebviewManager:
 
         return url
 
-    def create_webview(self):
-        """Create universal web view for any website"""
-        if self.webview is None:
+    def _ensure_profile(self):
+        """Initialize shared profile if needed"""
+        if self.profile is None:
             cookies_dir = os.path.join(get_config_dir(), "cookies")
             os.makedirs(cookies_dir, exist_ok=True)
 
-            # Fix: Store profile reference to prevent garbage collection
             self.profile = QWebEngineProfile("webview_profile", self.parent)
             self.profile.setPersistentStoragePath(cookies_dir)
             self.profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.AllowPersistentCookies)
 
-            page = SilentWebEnginePage(self.profile, self.parent)
+            # Enable Disk Cache for optimization
+            cache_dir = os.path.join(get_config_dir(), "cache")
+            os.makedirs(cache_dir, exist_ok=True)
+            self.profile.setCachePath(cache_dir)
+            self.profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.DiskHttpCache)
 
-            self.webview = QWebEngineView(self.parent)
-            self.webview.setPage(page)
-            
-            # Note: Do NOT use hide()/show() on WebEngineView!
-            # It causes the parent window to close/reopen due to compositor conflicts.
-            # Instead, we move the webview off-screen when not needed.
-            self.webview.setGeometry(-10000, -10000, 800, 600)
-            self.webview.show()  # Always keep visible, just off-screen
-            
-            self.webview.setUpdatesEnabled(False)
+    def create_webview(self):
+        """Initialize profile (webview creation is now lazy in load_url)"""
+        self._ensure_profile()
 
-            self.webview.loadFinished.connect(self.on_webview_load_finished)
+    def _create_webview_instance(self, url_key: str) -> QWebEngineView:
+        """Create a new webview instance for the given URL"""
+        self._ensure_profile()
+        
+        page = SilentWebEnginePage(self.profile, self.parent)
+        view = QWebEngineView(self.parent)
+        view.setPage(page)
+        
+        # Initialize view state
+        view.page_loaded = False
+        view.error_message = ""
+        view.error_notified = False
+        view.load_timeout_timer = None
+        
+        # Store URL key on the view for reference
+        view._url_key = url_key
 
-            settings = self.webview.settings()
-            settings.setAttribute(QWebEngineSettings.WebAttribute.LocalStorageEnabled, True)
-            settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
-            settings.setAttribute(QWebEngineSettings.WebAttribute.AllowRunningInsecureContent, True)  # Allow HTTP for local servers
-            settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
-            settings.setAttribute(QWebEngineSettings.WebAttribute.PluginsEnabled, True)
+        view.setUpdatesEnabled(False)
+        # Start off-screen
+        view.setGeometry(-10000, -10000, 800, 600)
+        view.show()
 
-            self.webview.page().setBackgroundColor(QColor(255, 255, 255))
+        view.loadFinished.connect(lambda success: self.on_webview_load_finished(view, success))
 
-            self.webview.installEventFilter(self.parent)
-            self.webview.setAttribute(Qt.WidgetAttribute.WA_AcceptTouchEvents, True)
-            
-            border_radius = int(16 * self.parent.scale_factor)
-            self.webview.setStyleSheet(f"""
-                QWebEngineView {{
-                    border-radius: {border_radius}px;
-                    background: white;
-                }}
-            """)
-            self.webview.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-            
-            self.webview.setUpdatesEnabled(True)
+        settings = view.settings()
+        settings.setAttribute(QWebEngineSettings.WebAttribute.LocalStorageEnabled, True)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.AllowRunningInsecureContent, True)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.PluginsEnabled, True)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.Accelerated2dCanvasEnabled, True)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.WebGLEnabled, True)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.ScrollAnimatorEnabled, True)
+
+        view.page().setBackgroundColor(QColor(255, 255, 255))
+        view.installEventFilter(self.parent)
+        view.setAttribute(Qt.WidgetAttribute.WA_AcceptTouchEvents, True)
+        
+        border_radius = self._border_radius_px()
+        view.setStyleSheet(f"QWebEngineView {{ border-radius: {border_radius}px; background: white; }}")
+        view.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        
+        view.setUpdatesEnabled(True)
+        return view
 
     def load_url(self, url: str):
-        """Load URL in webview"""
-        # Ensure webview exists (should be created once in __init__)
-        if not self.webview:
-            self.create_webview()
-            
+        """Load URL in webview (find existing or create new)"""
         url_object = self._prepare_url(url)
         if url_object is None:
-            self.error_message = "Invalid URL"
-            self.page_loaded = False
-            self.error_notified = False
+            # Handle invalid URL - maybe assume current view?
             return False
             
-        new_url = url_object.toString()
-        # Check if we are already on this URL (loaded or loading)
-        if self.current_url == new_url:
-            if self.page_loaded:
-                # Already loaded - just return success without reloading
-                return True
-            if not self.error_message:
-                # Already loading this URL and no error yet - don't restart
-                return True
-            # If there was an error, fall through to retry loading
+        new_url_key = url_object.toString()
+        
+        # Switch logic
+        if self.current_key != new_url_key:
+            # Hide previous view if it exists
+            if self.current_key and self.current_key in self.webviews:
+                self._hide_view_instance(self.webviews[self.current_key])
             
-        # Only update state and load if URL is different or there was an error
-        self.current_url = new_url
-        self.error_message = ""
-        self.error_notified = False
-        self.page_loaded = False
-        
-        # Set timeout for page load (10 seconds)
-        # Fix: Reuse existing timer to prevent memory leak
-        if self.load_timeout_timer:
-            self.load_timeout_timer.stop()
+            self.current_key = new_url_key
+            
+            # Reset geometry cache since we switched views
+            self._last_geometry = None
+            self._last_mask_size = None
+
+        # Check if we have a cached view for this URL
+        if new_url_key in self.webviews:
+            # View exists - reuse it!
+            view = self.webviews[new_url_key]
+            # We don't need to reload unless it failed previously or is empty
+            if view.page_loaded:
+                return True
+            if not view.error_message:
+                # Already loading
+                return True
+            # Fall through to retry if error
         else:
-            self.load_timeout_timer = QTimer(self.parent)
-            self.load_timeout_timer.setSingleShot(True)
-            self.load_timeout_timer.timeout.connect(self._on_load_timeout)
-        self.load_timeout_timer.start(10000)
+            # Create new view
+            view = self._create_webview_instance(new_url_key)
+            self.webviews[new_url_key] = view
+            
+        # Perform load
+        view.error_message = ""
+        view.error_notified = False
+        view.page_loaded = False
         
-        self.webview.setUrl(url_object)
+        # Timer setup
+        if view.load_timeout_timer:
+            view.load_timeout_timer.stop()
+        else:
+            view.load_timeout_timer = QTimer(self.parent)
+            view.load_timeout_timer.setSingleShot(True)
+            # Use partial or lambda to capture view
+            view.load_timeout_timer.timeout.connect(lambda: self._on_load_timeout(view))
+            
+        view.load_timeout_timer.start(10000)
+        
+        view.setUrl(url_object)
         return True
 
     def show_webview(self, geometry):
-        """Show webview with specified geometry"""
-        if not self.webview:
+        """Show current webview with specified geometry"""
+        view = self.webview
+        if not view:
             return False
         
-        if not self.page_loaded:
-            # Page is still loading - keep webview off-screen but with correct size
-            current_geom = self.webview.geometry()
-            if (current_geom.width() != geometry.width() or 
-                current_geom.height() != geometry.height()):
-                self.webview.setGeometry(-10000, -10000, geometry.width(), geometry.height())
-            self.webview.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        geom_tuple = (geometry.x(), geometry.y(), geometry.width(), geometry.height())
+        needs_geometry_update = self._last_geometry != geom_tuple
+        
+        if not view.page_loaded:
+            if needs_geometry_update:
+                current_geom = view.geometry()
+                if current_geom.x() < 0 or current_geom.y() < 0:
+                    view.setGeometry(-10000, -10000, geometry.width(), geometry.height())
+                    self._apply_mask(geometry.width(), geometry.height())
+            view.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
             return False
         
-        # Page is loaded - move webview to correct position
-        current_geom = self.webview.geometry()
-        if (current_geom.x() != geometry.x() or 
-            current_geom.y() != geometry.y() or
-            current_geom.width() != geometry.width() or 
-            current_geom.height() != geometry.height()):
-            self.webview.setGeometry(geometry)
+        if needs_geometry_update:
+            view.setUpdatesEnabled(False)
+            view.setGeometry(geometry)
+            self._apply_mask(geometry.width(), geometry.height())
+            view.setUpdatesEnabled(True)
+            self._last_geometry = geom_tuple
         
-        self.webview.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+        view.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
         return True
 
-    def hide_webview(self):
-        """Hide webview by moving it off-screen (don't use hide() - causes window recreation)"""
-        if self.webview:
-            self.webview.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-            self.webview.setGeometry(-10000, -10000, 1, 1)
+    def _hide_view_instance(self, view: QWebEngineView):
+        """Helper to hide a specific view"""
+        if view:
+            view.setUpdatesEnabled(False)
+            view.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            view.setGeometry(-10000, -10000, 1, 1)
+            view.setUpdatesEnabled(True)
 
-    def on_webview_load_finished(self, success: bool):
+    def hide_webview(self):
+        """Hide current webview"""
+        self._hide_view_instance(self.webview)
+        self._last_mask_size = None
+        self._last_geometry = None
+
+    def on_webview_load_finished(self, view: QWebEngineView, success: bool):
         """Handle webview page load completion"""
-        if self.load_timeout_timer:
-            self.load_timeout_timer.stop()
+        if getattr(view, 'load_timeout_timer', None):
+            view.load_timeout_timer.stop()
             
         if success:
-            self.page_loaded = True
-            self.error_message = ""
-            self.error_notified = False
-            # Don't enable mouse events here - let parent decide via show_webview()
-            # The webview is still off-screen until parent calls show_webview()
+            view.page_loaded = True
+            view.error_message = ""
+            view.error_notified = False
         else:
-            self.error_message = "Failed to load page"
-            self.page_loaded = False
-            # Move webview off-screen on error
-            if self.webview:
-                self.hide_webview()
-                
-        # Notify parent to update UI (callback handles update logic)
-        if hasattr(self.parent, 'on_webview_load_finished_callback'):
-            self.parent.on_webview_load_finished_callback(success)
+            view.error_message = "Failed to load page"
+            view.page_loaded = False
+            self._hide_view_instance(view)
+            
+        # Only notify parent if this is the current view
+        if self.webview == view:
+            if hasattr(self.parent, 'on_webview_load_finished_callback'):
+                self.parent.on_webview_load_finished_callback(success)
 
-    def _on_load_timeout(self):
+    def _on_load_timeout(self, view: QWebEngineView):
         """Handle load timeout"""
-        self.error_message = "Page load timeout"
-        self.page_loaded = False
-        if self.webview:
-            self.hide_webview()
-        if hasattr(self.parent, 'update'):
+        view.error_message = "Page load timeout"
+        view.page_loaded = False
+        self._hide_view_instance(view)
+        
+        if self.webview == view and hasattr(self.parent, 'update'):
             self.parent.update()
 
     def cleanup(self):
-        """Clean up webview and profiles to prevent memory leaks"""
-        # Fix: Stop and cleanup timer properly
-        if self.load_timeout_timer:
-            self.load_timeout_timer.stop()
-            self.load_timeout_timer.deleteLater()
-            self.load_timeout_timer = None
+        """Clean up all webviews"""
+        for view in self.webviews.values():
+            timer = getattr(view, 'load_timeout_timer', None)
+            if timer:
+                timer.stop()
+                timer.deleteLater()
             
-        if self.webview:
-            # Fix: Disconnect signals before deleting to prevent callbacks on deleted object
-            try:
-                self.webview.loadFinished.disconnect(self.on_webview_load_finished)
-            except (TypeError, RuntimeError):
-                pass  # Signal was not connected or already disconnected
-            self.webview.setParent(None)
-            self.webview.deleteLater()
-            self.webview = None
+            view.setParent(None)
+            view.deleteLater()
+            
+        self.webviews.clear()
+        self.current_key = None
         
-        # Fix: Cleanup profile
         if self.profile:
+            self.profile.deleteLater()
             self.profile = None
+        
+        self._last_mask_size = None

@@ -80,7 +80,7 @@ def _ensure_picamera2():
             result = subprocess.run([
                 sys.executable, '-c', 
                 'import picamera2; print("OK")'
-            ], capture_output=True, text=True, timeout=5)
+            ], capture_output=True, text=True, timeout=2)  # Reduced from 5s to 2s
             
             if result.returncode != 0 or "OK" not in result.stdout:
                 error_output = result.stderr.strip()
@@ -118,7 +118,7 @@ def _ensure_picamera2():
                 result = subprocess.run([
                     sys.executable, '-c', 
                     'import picamera2; print("OK")'
-                ], capture_output=True, text=True, timeout=5)
+                ], capture_output=True, text=True, timeout=2)  # Reduced from 5s to 2s
                 
                 if result.returncode != 0 or "OK" not in result.stdout:
                     error_output = result.stderr.strip()
@@ -197,7 +197,7 @@ class AmbientLightMonitor(QThread):
     errorOccurred = pyqtSignal(str)
     cameraIndexResolved = pyqtSignal(int)
 
-    MAX_FALLBACK_CAMERAS = 3
+    MAX_FALLBACK_CAMERAS = 1  # Reduced from 3 to speed up initialization
 
     def __init__(
         self,
@@ -254,7 +254,7 @@ class AmbientLightMonitor(QThread):
                 result = subprocess.run([
                     sys.executable, '-c', 
                     'import picamera2; print("OK")'
-                ], capture_output=True, text=True, timeout=3)
+                ], capture_output=True, text=True, timeout=2)  # Reduced from 3s to 2s
                 
                 if result.returncode != 0 or "OK" not in result.stdout:
                     error_output = result.stderr.strip()
@@ -269,11 +269,6 @@ class AmbientLightMonitor(QThread):
                     
             except (subprocess.TimeoutExpired, subprocess.SubprocessError, FileNotFoundError, Exception) as e:
                 print(f"[AutoBrightness] ERROR: Picamera2 subprocess test failed: {e}", file=sys.stderr, flush=True)
-                self.errorOccurred.emit("missing_backend")
-                return
-            
-            if _ensure_picamera2() is None:
-                print("[AutoBrightness] ERROR: Picamera2 backend not available", file=sys.stderr, flush=True)
                 self.errorOccurred.emit("missing_backend")
                 return
 
@@ -316,30 +311,13 @@ class AmbientLightMonitor(QThread):
                 self._using_picamera2 = False
 
         # Final Raspberry Pi fallback: Picamera2 native capture (libcamera-based)
-        if not self._capture and self._is_raspberry_pi:
-            # Дополнительная проверка перед попыткой picamera2
-            try:
-                import subprocess
-                
-                result = subprocess.run([
-                    sys.executable, '-c', 
-                    'import picamera2; print("OK")'
-                ], capture_output=True, text=True, timeout=3)
-                
-                if result.returncode == 0 and "OK" in result.stdout:
-                    self._capture = self._open_picamera2()
-                    if self._capture:
-                        self._using_picamera2 = True
-                else:
-                    error_output = result.stderr.strip()
-                    if "numpy.dtype" in error_output and "binary incompatibility" in error_output:
-                        print(f"[AutoBrightness] Skipping Picamera2 due to numpy/simplejpeg compatibility issue", file=sys.stderr, flush=True)
-                        print(f"[AutoBrightness] Try: pip install --upgrade numpy simplejpeg", file=sys.stderr, flush=True)
-                    else:
-                        print(f"[AutoBrightness] Skipping Picamera2 due to test failure: {error_output}", file=sys.stderr, flush=True)
-                    
-            except (subprocess.TimeoutExpired, subprocess.SubprocessError, FileNotFoundError, Exception) as e:
-                print(f"[AutoBrightness] Skipping Picamera2 due to subprocess error: {e}", file=sys.stderr, flush=True)
+        # Skip redundant subprocess check - already done at thread start
+        if not self._capture and self._is_raspberry_pi and _ensure_picamera2() is not None:
+            if self._verbose:
+                print("[AutoBrightness] Trying Picamera2 fallback...", file=sys.stderr, flush=True)
+            self._capture = self._open_picamera2()
+            if self._capture:
+                self._using_picamera2 = True
 
         if not self._capture:
             print("[AutoBrightness] ERROR: Failed to open camera with any backend", file=sys.stderr, flush=True)
@@ -449,7 +427,12 @@ class AmbientLightMonitor(QThread):
         self._running = False
         self._running_mutex.unlock()
 
-        self.wait(1500)
+        # Wait for thread to finish with timeout
+        if not self.wait(2000):  # Increased timeout to 2s
+            # Force terminate if thread doesn't stop gracefully
+            self.terminate()
+            self.wait(500)  # Wait a bit after terminate
+        
         self._release_capture()
 
     def _release_capture(self) -> None:
@@ -484,20 +467,19 @@ class AmbientLightMonitor(QThread):
                 targets = self._build_capture_targets(idx)
                 capture = None
                 for target in targets:
-                    if self._verbose and target != idx:
+                    if self._verbose:
                         print(f"[AutoBrightness] -> Trying target '{target}'", file=sys.stderr, flush=True)
                     capture = cv2.VideoCapture(target, backend)
                     if capture and capture.isOpened():
-                        # Для Raspberry Pi попробуем прочитать тестовый кадр
-                        if self._is_raspberry_pi:
-                            ret, test_frame = capture.read()
-                            if not ret or test_frame is None:
-                                if self._verbose:
-                                    print(f"[AutoBrightness] Camera {idx} ({target}) opened but cannot read frames", file=sys.stderr, flush=True)
-                                capture.release()
-                                continue
+                        # Quick validation - single test frame only
+                        ret, test_frame = capture.read()
+                        if not ret or test_frame is None:
                             if self._verbose:
-                                print(f"[AutoBrightness] Camera {idx} ({target}) test read successful", file=sys.stderr, flush=True)
+                                print(f"[AutoBrightness] Camera {idx} ({target}) opened but cannot read frames", file=sys.stderr, flush=True)
+                            capture.release()
+                            continue
+                        if self._verbose:
+                            print(f"[AutoBrightness] Camera {idx} ({target}) test read successful", file=sys.stderr, flush=True)
 
                         if self._verbose:
                             print(f"[AutoBrightness] Camera {idx} ({target}) opened successfully", file=sys.stderr, flush=True)

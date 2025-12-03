@@ -4,7 +4,7 @@ import logging
 import os
 import sys
 
-from PyQt6.QtCore import QtMsgType, qInstallMessageHandler
+from PyQt6.QtCore import Qt, QtMsgType, qInstallMessageHandler
 from PyQt6.QtWidgets import QApplication
 
 from config import (
@@ -46,7 +46,7 @@ def qt_message_handler(mode: QtMsgType, context, message: str) -> None:
     
     Args:
         mode: Qt message type (Debug, Warning, Critical, Fatal)
-        context: Qt message context (unused)
+        context: Qt message context
         message: Log message text
     """
     qt_logger = logging.getLogger('Qt')
@@ -85,13 +85,27 @@ def main() -> int:
     
     # Suppress JavaScript logs from Chromium (BEFORE creating QApplication)
     os.environ['QT_LOGGING_RULES'] = 'qt.webenginecontext.debug=false'
-    os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = '--disable-logging --log-level=3'
     
-    # Suppress Qt logs
-    qInstallMessageHandler(qt_message_handler)
+    # Performance flags for Chromium
+    os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = (
+        '--disable-logging --log-level=3 '
+        '--ignore-gpu-blacklist '
+        '--enable-gpu-rasterization '
+        '--enable-zero-copy '
+        '--enable-native-gpu-memory-buffers '
+        '--canvas-oop-rasterization'
+    )
     
     try:
+        # Enable OpenGL context sharing (critical for WebEngine performance)
+        QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
+        
+        # Create QApplication FIRST before installing message handler
         app = QApplication(sys.argv)
+        
+        # Now install Qt message handler AFTER QApplication is created
+        qInstallMessageHandler(qt_message_handler)
+        
         clock = NDotClockSlider()
         clock.show()
         logger.info("Application initialized successfully")

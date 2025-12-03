@@ -98,10 +98,8 @@ class AnimatedSlideContainer(QWidget):
             parent.update()
 
             # Update webviews once per batch instead of per property
-            if hasattr(parent, 'update_youtube_webview_position'):
-                parent.update_youtube_webview_position()
-            if hasattr(parent, 'update_home_assistant_webview_position'):
-                parent.update_home_assistant_webview_position()
+            if hasattr(parent, 'update_active_webviews'):
+                parent.update_active_webviews()
 
     offset_x = pyqtProperty(float, get_offset_x, set_offset_x)
     scale = pyqtProperty(float, get_scale, set_scale)

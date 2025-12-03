@@ -30,6 +30,7 @@ class BrightnessManager(QObject):
         # State
         self._auto_brightness_smoothed = self._manual_brightness
         self._current_display_brightness = self._manual_brightness
+        self._cached_brightness = self._manual_brightness  # Cache for fast access
         self._ambient_light_monitor: Optional[AmbientLightMonitor] = None
         self._pending_auto_brightness_activation = False
         self._suppress_auto_brightness_save = False
@@ -51,9 +52,7 @@ class BrightnessManager(QObject):
         self._system_backlight: Optional[SystemBacklightController] = None
         self._system_backlight_error_notified = False
         self._system_backlight_verbose = os.environ.get("NDOT_SYSTEM_BACKLIGHT_VERBOSE", "").lower() in ("1", "true", "yes")
-        self._system_backlight_last_logged_raw: Optional[int] = None
         self._system_backlight_last_ui_log: Optional[float] = None
-        self._backlight_last_apply_log: Optional[float] = None
         
         # Verbose logging
         auto_verbose_env = os.environ.get("NDOT_AUTO_BRIGHTNESS_VERBOSE", "")
@@ -236,9 +235,9 @@ class BrightnessManager(QObject):
             'auto_brightness_interval_ms': self._auto_brightness_interval_ms,
         }
 
-    def set_manual_brightness(self, value: float):
+    def set_manual_brightness(self, value: float, *, animate: bool = True):
         """Set manual brightness."""
-        self._apply_brightness(value, from_auto=False)
+        self._apply_brightness(value, from_auto=False, animate=animate)
 
     def _initialize_system_backlight(self):
         """Configure optional system backlight controller."""
@@ -512,7 +511,7 @@ class BrightnessManager(QObject):
             if self._auto_brightness_verbose:
                 print(f"[AutoBrightness] Camera index updated to {index}", file=sys.stderr, flush=True)
 
-    def _apply_brightness(self, value: float, *, from_auto: bool):
+    def _apply_brightness(self, value: float, *, from_auto: bool, animate: bool = True):
         """Apply brightness value to system and UI."""
         value = max(0.05, min(1.0, value))
         
@@ -522,6 +521,12 @@ class BrightnessManager(QObject):
             if self._auto_brightness_enabled:
                 self.set_auto_brightness_enabled(False, user_triggered=True)
         
+        if not animate:
+            if self._brightness_animation.state() == QPropertyAnimation.State.Running:
+                self._brightness_animation.stop()
+            self._apply_brightness_direct(value)
+            return
+
         # Animate change
         if self._brightness_animation.state() == QPropertyAnimation.State.Running:
             self._brightness_animation.stop()
@@ -534,11 +539,14 @@ class BrightnessManager(QObject):
         """Directly apply brightness without animation (called by animation)."""
         self._current_display_brightness = value
         
+        # Update cache only if changed significantly (reduces UI invalidations)
+        if abs(self._cached_brightness - value) > 0.001:
+            self._cached_brightness = value
+            # Emit signal for UI updates only when brightness actually changes
+            self.brightness_changed.emit(value)
+        
         # Apply to system backlight
         self._apply_system_backlight(value)
-        
-        # Emit signal for UI updates
-        self.brightness_changed.emit(value)
 
     def _apply_system_backlight(self, value: float):
         """Apply brightness to system backlight controller."""
@@ -546,32 +554,26 @@ class BrightnessManager(QObject):
             return
             
         try:
-            # Map 0.0-1.0 to 0-max_brightness
-            # Ensure minimum brightness to avoid black screen
-            min_val = 1
-            max_val = self._system_backlight.max_brightness
-            
             # Apply gamma for better perception
             perceptual_value = math.pow(value, 2.2)
             
-            raw_value = int(min_val + (max_val - min_val) * perceptual_value)
-            raw_value = max(min_val, min(max_val, raw_value))
-            
             # Log if changed significantly
-            if (self._system_backlight_last_logged_raw is None or 
-                abs(self._system_backlight_last_logged_raw - raw_value) > max_val * 0.05):
+            if (self._system_backlight_last_ui_log is None or 
+                abs(self._system_backlight_last_ui_log - value) > 0.05):
                 if self._system_backlight_verbose:
-                    print(f"[Backlight] Setting system brightness: {raw_value}/{max_val} ({value:.2f})", file=sys.stderr, flush=True)
-                self._system_backlight_last_logged_raw = raw_value
+                    print(f"[Backlight] Setting system brightness: {value:.2f} (perceptual: {perceptual_value:.2f})", file=sys.stderr, flush=True)
+                self._system_backlight_last_ui_log = value
                 
-            self._system_backlight.set_brightness(raw_value)
+            # Use set_level() which accepts 0.0-1.0 and handles conversion internally
+            self._system_backlight.set_level(perceptual_value)
             
         except Exception as e:
             if self._system_backlight_verbose:
                 print(f"[Backlight] Error setting brightness: {e}", file=sys.stderr, flush=True)
 
     def get_brightness(self) -> float:
-        return self._current_display_brightness
+        """Get cached brightness value (optimized for frequent calls)."""
+        return self._cached_brightness
 
     @property
     def has_system_backlight(self) -> bool:
@@ -580,3 +582,10 @@ class BrightnessManager(QObject):
 
     def is_auto_enabled(self) -> bool:
         return self._auto_brightness_enabled
+    
+    def cleanup(self):
+        """Cleanup resources on shutdown."""
+        # Stop reconnect timer
+        self._stop_reconnect_timer()
+        # Stop ambient light monitor
+        self._teardown_ambient_monitor()

@@ -84,6 +84,34 @@ from ui.webviews import WebviewManager
 from ui.settings_manager import SettingsManager
 
 
+class BrightnessOverlay(QWidget):
+    """Transparent overlay for software brightness control."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+        self._opacity = 0.0
+        self.hide()
+
+    def set_opacity(self, opacity: float):
+        """Set overlay opacity (0.0 - 1.0)."""
+        self._opacity = max(0.0, min(1.0, opacity))
+        if self._opacity > 0.001:
+            self.show()
+            self.raise_()
+        else:
+            self.hide()
+        self.update()
+
+    def paintEvent(self, event):
+        if self._opacity <= 0:
+            return
+        painter = QPainter(self)
+        painter.setBrush(QColor(0, 0, 0, int(self._opacity * 255)))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRect(self.rect())
+
+
 class NDotClockSlider(QWidget):
     """Main clock application with slider interface"""
 
@@ -170,6 +198,7 @@ class NDotClockSlider(QWidget):
         self.brightness_manager.auto_brightness_toggled.connect(self._on_auto_brightness_toggled)
 
         # Initialize Webview Manager
+        self.scale_factor = 1.0  # ensure available for dependent components
         self.webview_manager = WebviewManager(self)
         
         # Derived settings
@@ -190,7 +219,13 @@ class NDotClockSlider(QWidget):
         # Scaling factor for UI elements
         self.base_width = 800
         self.base_height = 480
-        self.scale_factor = 1.0
+
+        # Ленивая инициализация webview - создаём только при первом обращении
+        self._webview_init_pending = False
+        self._webview_initialized = False
+        
+        # Software brightness overlay
+        self.brightness_overlay = BrightnessOverlay(self)
         
         # Digit patterns
         self.setup_digit_patterns()
@@ -207,8 +242,8 @@ class NDotClockSlider(QWidget):
             self._breathing_lookup.append(intensity)
         self._breathing_frame = 0  # Current frame in breathing cycle
 
-        # ARM optimization: Cache for complete gradient dots (including halo)
-        self._glow_dot_cache: Dict[Tuple[int, int, int, int, bool], QPixmap] = {}  # (radius, r, g, b, with_highlight) -> pixmap
+        # ARM optimization: Cache for complete gradient dots (including halo) - матовый вид
+        self._glow_dot_cache: Dict[Tuple[int, int, int, int], QPixmap] = {}  # (radius, r, g, b) -> pixmap
         self._glow_dot_cache_max_size = 300  # LRU limit - increased for better ARM performance
 
         # ARM optimization: SVG weather icon pixmap cache
@@ -363,8 +398,13 @@ class NDotClockSlider(QWidget):
         self.panel_scale_animation = None
         self._panel_opacity = 0.0
 
-        # Webview Preload
-        self.webview_manager.create_webview()
+        # Webview Preload & Caching
+        # Preload all webview slides to ensure they are ready and cached
+        for slide in self.slides:
+            if slide['type'] == SlideType.WEBVIEW:
+                url = slide['data'].get('url')
+                if url:
+                    self.webview_manager.load_url(url)
         
         # Fix: Preload SVG weather icons in background for ARM optimization
         self._preload_weather_icons()
@@ -385,6 +425,15 @@ class NDotClockSlider(QWidget):
     def _on_brightness_changed(self, value: float):
         """Handle brightness change signal."""
         self._update_cached_colors()
+        
+        # Update software overlay if no system backlight
+        if not self.brightness_manager.has_system_backlight:
+            # value is 0.0-1.0, overlay opacity should be inverted
+            # 1.0 brightness -> 0.0 opacity
+            # 0.0 brightness -> 1.0 opacity
+            # Note: BrightnessManager clamps min brightness to 0.05
+            self.brightness_overlay.set_opacity(1.0 - value)
+            
         self.update()
         
         # Sync slider if needed (without signaling)
@@ -1240,6 +1289,9 @@ class NDotClockSlider(QWidget):
             self.mouse_pressed = False
             self.is_dragging = False
             self.drag_current_offset = 0.0
+            
+            # Update webview geometry after swipe completes
+            self.update_webview_geometry()
 
     def on_long_press(self):
         """Handle long press to enter edit mode"""
@@ -2654,29 +2706,65 @@ class NDotClockSlider(QWidget):
         return -1
 
     def update_active_webviews(self):
-        """Synchronize embedded webviews with slides
+        """Synchronize embedded webviews with slides (optimized for smooth transitions)
 
-        Shows all webview slides at their respective positions to enable smooth
-        animation transitions between webview slides. Each webview is positioned
-        at its slide's location in the slide strip.
+        Shows webview if it is visible in the viewport, even during transitions.
         """
         if self.edit_mode or self.card_edit_mode:
             self.hide_all_webviews()
             return
 
-        # Find all webview slides and show them at their positions
-        webview_shown = False
-        for i, slide in enumerate(self.slides):
-            if slide['type'] == SlideType.WEBVIEW and i == self.current_slide:
-                url = slide['data'].get('url', '')
-                if url:
-                    self.show_webview(url)
-                    webview_shown = True
-                break
+        # Find the most visible webview slide
+        best_slide_index = -1
+        best_intersection_area = 0
+        best_geom = QRect()
+        best_url = ""
 
-        # Hide webview if not shown
-        if not webview_shown:
+        for i, slide in enumerate(self.slides):
+            if slide['type'] == SlideType.WEBVIEW:
+                geom = self.get_embedded_card_geometry(i)
+                intersection = geom.intersected(self.rect())
+                area = intersection.width() * intersection.height()
+                
+                if area > best_intersection_area:
+                    best_intersection_area = area
+                    best_slide_index = i
+                    best_geom = geom
+                    best_url = slide['data'].get('url', '')
+
+        if best_slide_index != -1:
+            if not best_url:
+                self.hide_webview()
+                return
+
+            # Lazy init
+            if not self._webview_initialized and not self._webview_init_pending:
+                self._webview_init_pending = True
+                self._webview_initialized = True
+                QTimer.singleShot(50, lambda: self._init_and_show_webview(best_url))
+                return
+
+            self.webview_manager.load_url(best_url)
+            self.webview_manager.show_webview(best_geom)
+            
+            # Ensure brightness overlay is on top
+            if hasattr(self, 'brightness_overlay') and self.brightness_overlay.isVisible():
+                self.brightness_overlay.raise_()
+        else:
             self.hide_webview()
+    
+    def _init_and_show_webview(self, url: str):
+        """Инициализация и показ webview при первом обращении"""
+        if not self.webview_manager:
+            self._webview_init_pending = False
+            return
+        # Создаём webview
+        self.webview_manager.create_webview()
+        # Загружаем URL
+        self.webview_manager.load_url(url)
+        self._webview_init_pending = False
+        # Обновляем отображение
+        self.update()
 
     def on_webview_load_finished_callback(self, success: bool):
         """Callback from WebviewManager when load finishes"""
@@ -2691,9 +2779,16 @@ class NDotClockSlider(QWidget):
                 if slide['type'] == SlideType.WEBVIEW:
                     # Page just loaded - show webview at correct position
                     webview_slide_index = self.get_slide_index_for_type(SlideType.WEBVIEW)
-                    if webview_slide_index >= 0:
+                    if webview_slide_index >= 0 and webview_slide_index == self.current_slide:
                         geom = self.get_embedded_card_geometry(webview_slide_index)
                         self.webview_manager.show_webview(geom)
+                        
+                        # Ensure brightness overlay is on top
+                        if hasattr(self, 'brightness_overlay') and self.brightness_overlay.isVisible():
+                            self.brightness_overlay.raise_()
+                            
+                        # Trigger minimal repaint only in webview area
+                        self.update(geom)
                     return  # No full update needed
         # Only call full update on error
         if not success:
@@ -2721,6 +2816,9 @@ class NDotClockSlider(QWidget):
 
         if hasattr(self, 'offset_animation') and self.offset_animation:
             self._start_property_animation(self.offset_animation, float(target_offset))
+        
+        # Update webviews after animation starts
+        self.update_active_webviews()
         self.update()
 
     def _finalize_offset_animation(self):
@@ -2799,8 +2897,8 @@ class NDotClockSlider(QWidget):
 
     def update_webview_geometry(self):
         """Update geometry of the active webview to match the slide position"""
-        # Don't update geometry in edit modes
-        if self.edit_mode or self.card_edit_mode:
+        # Don't update geometry in edit modes or during drag
+        if self.edit_mode or self.card_edit_mode or self.is_dragging:
             return
             
         if not self.webview_manager.webview:
@@ -2817,19 +2915,8 @@ class NDotClockSlider(QWidget):
         if webview_slide_index >= 0 and webview_slide_index == self.current_slide:
              geom = self.get_embedded_card_geometry(webview_slide_index)
              
-             # Avoid unnecessary updates
-             current_geom = self.webview_manager.webview.geometry()
-             if geom != current_geom:
-                 self.webview_manager.webview.setGeometry(geom)
-                 
-                 # Update mask only if size changed or mask not set
-                 # We check mask() to ensure it's set initially
-                 if geom.size() != current_geom.size() or self.webview_manager.webview.mask().isEmpty():
-                     border_radius = int(16 * self.scale_factor)
-                     path = QPainterPath()
-                     path.addRoundedRect(QRectF(0, 0, geom.width(), geom.height()), border_radius, border_radius)
-                     region = QRegion(path.toFillPolygon().toPolygon())
-                     self.webview_manager.webview.setMask(region)
+             # Use the centralized show_webview method which handles optimization
+             self.webview_manager.show_webview(geom)
 
     def on_timeout(self):
         """ARM-optimized timer callback with dynamic interval adjustment
@@ -3004,6 +3091,12 @@ class NDotClockSlider(QWidget):
                 self.scale_animation.state() != QPropertyAnimation.State.Running and
                 self.offset_y_animation.state() != QPropertyAnimation.State.Running):
             self._clear_edit_transition_guard()
+            
+        # Resize brightness overlay
+        if hasattr(self, 'brightness_overlay'):
+            self.brightness_overlay.resize(self.size())
+            if self.brightness_overlay.isVisible():
+                self.brightness_overlay.raise_()
 
     def paintEvent(self, event):
         """Main paint event"""
@@ -3358,7 +3451,7 @@ class NDotClockSlider(QWidget):
 
     def draw_glow_dot(self, painter: QPainter, x: float, y: float, radius: float,
                      color: QColor, *, with_highlight: bool = True):
-        """ARM-optimized: Draw a glowing dot with full pixmap caching"""
+        """ARM-optimized: Draw a glowing dot with full pixmap caching (матовый вид)"""
         # Round radius and color for cache key (10% buckets for brightness variations - better for ARM)
         radius_rounded = int(radius)
         brightness_bucket = int(self.user_brightness * 10) / 10.0  # 10% increments - reduces cache misses
@@ -3366,7 +3459,8 @@ class NDotClockSlider(QWidget):
         g = int(color.green() * brightness_bucket)
         b = int(color.blue() * brightness_bucket)
 
-        cache_key = (radius_rounded, r, g, b, with_highlight)
+        # with_highlight больше не используется, убран из cache_key для инвалидации старого кэша
+        cache_key = (radius_rounded, r, g, b)
 
         # Check cache
         if cache_key in self._glow_dot_cache:
@@ -3417,32 +3511,10 @@ class NDotClockSlider(QWidget):
             pix_painter.setBrush(halo_gradient)
             pix_painter.drawEllipse(QPointF(center_x, center_y), halo_radius, halo_radius)
 
-        # Main circle
+        # Main circle - матовый вид без глянцевого highlight
         inner_radius = radius * 0.9 if is_red else radius * 0.82
         pix_painter.setBrush(base_color)
         pix_painter.drawEllipse(QPointF(center_x, center_y), inner_radius, inner_radius)
-
-        # Highlight
-        if with_highlight and self.user_brightness > 0.5:
-            highlight_radius = inner_radius * (0.6 if is_red else 0.5)
-            highlight_center = QPointF(center_x - inner_radius * 0.18, center_y - inner_radius * 0.22)
-
-            highlight_brightness = min(1.0, (self.user_brightness - 0.5) * 2)
-            highlight_alpha = int(180 * highlight_brightness) if is_red else int(160 * highlight_brightness)
-
-            highlight_color = QColor(
-                min(255, int((base_color.red() + 45) * 1.3 * highlight_brightness)),
-                min(255, int((base_color.green() + 45) * highlight_brightness)),
-                min(255, int((base_color.blue() + 45) * highlight_brightness)),
-                highlight_alpha
-            )
-
-            highlight_gradient = QRadialGradient(highlight_center, highlight_radius)
-            highlight_gradient.setColorAt(0.0, highlight_color)
-            highlight_color.setAlpha(0)
-            highlight_gradient.setColorAt(1.0, highlight_color)
-            pix_painter.setBrush(highlight_gradient)
-            pix_painter.drawEllipse(highlight_center, highlight_radius, highlight_radius)
 
         pix_painter.end()
 
@@ -3804,7 +3876,7 @@ class NDotClockSlider(QWidget):
         """Draw custom text slide"""
         text = slide['data'].get('text', self._tr('custom_default_text'))
 
-        painter.setPen(QColor(220, 220, 220))
+        painter.setPen(self._scale_color_by_brightness(QColor(220, 220, 220)))
         font_size = max(14, int(24 * self.scale_factor))
         painter.setFont(QFont(self.font_family, font_size))
 
@@ -3828,6 +3900,8 @@ class NDotClockSlider(QWidget):
         elif 'homeassistant' in url or ':8123' in url:
             icon = "🏠"
             icon_color = QColor(0, 153, 255)
+            
+        icon_color = self._scale_color_by_brightness(icon_color)
 
         # Draw icon
         painter.setPen(icon_color)
@@ -3840,7 +3914,7 @@ class NDotClockSlider(QWidget):
         painter.drawText(icon_rect, Qt.AlignmentFlag.AlignCenter, icon)
 
         # Draw title below
-        painter.setPen(QColor(240, 240, 240))
+        painter.setPen(self._scale_color_by_brightness(QColor(240, 240, 240)))
         title_font_size = max(16, int(24 * self.scale_factor))
         painter.setFont(QFont(self.font_family, title_font_size, QFont.Weight.Bold))
 
@@ -3851,7 +3925,7 @@ class NDotClockSlider(QWidget):
 
         # Show error message if any
         if self.webview_manager.error_message:
-            painter.setPen(QColor(255, 110, 110))
+            painter.setPen(self._scale_color_by_brightness(QColor(255, 110, 110)))
             error_font = QFont(self.font_family, max(12, int(16 * self.scale_factor)))
             painter.setFont(error_font)
             error_rect = QRect(margin, title_rect.bottom() + self.get_spacing(8, 6),
@@ -3863,7 +3937,7 @@ class NDotClockSlider(QWidget):
 
     def draw_add_slide(self, painter: QPainter):
         """Draw add button slide"""
-        painter.setPen(QColor(150, 150, 150))
+        painter.setPen(self._scale_color_by_brightness(QColor(150, 150, 150)))
         plus_font_size = max(28, int(40 * self.scale_factor))
         painter.setFont(QFont(self.font_family, plus_font_size, QFont.Weight.Bold))
 
@@ -3920,7 +3994,8 @@ class NDotClockSlider(QWidget):
         # Draw button background
         button_rect = QRectF(button_x, button_y, button_size, button_size)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(70, 70, 70, 180))
+        bg_color = self._scale_color_by_brightness(QColor(70, 70, 70, 180))
+        painter.setBrush(bg_color)
         radius = button_size / 4
         painter.drawRoundedRect(button_rect, radius, radius)
 
@@ -3930,7 +4005,8 @@ class NDotClockSlider(QWidget):
         icon_y = button_y + icon_padding
         icon_size = button_size - 2 * icon_padding
 
-        painter.setPen(QPen(QColor(220, 220, 220), max(2, int(2 * self.scale_factor))))
+        icon_color = self._scale_color_by_brightness(QColor(220, 220, 220))
+        painter.setPen(QPen(icon_color, max(2, int(2 * self.scale_factor))))
         painter.setBrush(Qt.BrushStyle.NoBrush)
 
         if self.is_fullscreen:
@@ -4080,11 +4156,12 @@ class NDotClockSlider(QWidget):
 
     @property
     def user_brightness(self) -> float:
-        return self.brightness_manager.manual_brightness
+        # Возвращаем текущую системную яркость (учитывает авто-яркость и программные изменения)
+        return self.brightness_manager.get_brightness()
 
     @user_brightness.setter
     def user_brightness(self, value: float):
-        self.brightness_manager.set_manual_brightness(value)
+        self.brightness_manager.set_manual_brightness(value, animate=False)
 
     @property
     def digit_color(self) -> QColor:
@@ -4146,7 +4223,7 @@ class NDotClockSlider(QWidget):
         """Manual slider handler."""
         if self.brightness_manager.is_auto_enabled():
             return
-        self.brightness_manager.set_manual_brightness(value / 100.0)
+        self.brightness_manager.set_manual_brightness(value / 100.0, animate=False)
     def _create_download_progress_popup(self, parent=None):
         """Factory to create download progress popup with consistent parenting."""
         return DownloadProgressPopup(parent or self)
@@ -4206,6 +4283,11 @@ class NDotClockSlider(QWidget):
         """ARM-optimized: Update color cache with smart invalidation"""
         brightness = self.brightness_manager.get_brightness()
         
+        # If using software overlay (no hardware backlight), keep colors bright
+        # and let the overlay handle dimming
+        if not self.brightness_manager.has_system_backlight:
+            brightness = 1.0
+        
         digit_scaled = QColor(self._digit_color)
         digit_scaled.setRed(int(digit_scaled.red() * brightness))
         digit_scaled.setGreen(int(digit_scaled.green() * brightness))
@@ -4260,9 +4342,14 @@ class NDotClockSlider(QWidget):
             # Clean up webviews
             self.webview_manager.cleanup()
 
-            self._teardown_ambient_monitor()
+            # Clean up brightness manager (stops ambient light monitor thread)
+            if hasattr(self, 'brightness_manager') and self.brightness_manager:
+                self.brightness_manager.cleanup()
+            
             self.save_settings()
         except Exception:
             pass  # Игнорируем ошибки при закрытии
         finally:
             super().closeEvent(event)
+
+

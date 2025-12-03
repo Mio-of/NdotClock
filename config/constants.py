@@ -1,6 +1,6 @@
 """Application-wide constant values."""
 
-__version__ = "1.4.1"  # Updated with improvements
+__version__ = "1.4.2"  # Updated with improvements
 __github_repo__ = "Mio-of/NdotClock"
 __github_branch__ = "main"
 __github_api_commits_url__ = (
