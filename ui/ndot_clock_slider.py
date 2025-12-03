@@ -384,6 +384,7 @@ class NDotClockSlider(QWidget):
 
     def _on_brightness_changed(self, value: float):
         """Handle brightness change signal."""
+        self._update_cached_colors()
         self.update()
         
         # Sync slider if needed (without signaling)
