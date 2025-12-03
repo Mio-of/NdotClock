@@ -103,8 +103,8 @@ def _ensure_picamera2():
         # Проверяем на ошибку numpy/simplejpeg несовместимости
         error_str = str(exc)
         if "numpy/simplejpeg incompatibility" in error_str:
-            print(f"[AutoBrightness] picamera2 unavailable due to numpy/simplejpeg compatibility issue", file=sys.stderr, flush=True)
-            print(f"[AutoBrightness] This is a known issue on Raspberry Pi. Try: pip install --upgrade numpy simplejpeg", file=sys.stderr, flush=True)
+            print("[AutoBrightness] picamera2 unavailable due to numpy/simplejpeg compatibility issue", file=sys.stderr, flush=True)
+            print("[AutoBrightness] This is a known issue on Raspberry Pi. Try: pip install --upgrade numpy simplejpeg", file=sys.stderr, flush=True)
         else:
             print(f"[AutoBrightness] picamera2 import error: {exc}", file=sys.stderr, flush=True)
         
@@ -219,6 +219,7 @@ class AmbientLightMonitor(QThread):
         self._camera_override = env_override or None
         # Enable verbose logging for debugging camera issues
         self._verbose = os.environ.get("NDOT_AUTO_BRIGHTNESS_VERBOSE", "").lower() in ("1", "true", "yes")
+        self._is_pi_5 = self._detect_raspberry_pi_5()
         # Picamera2 fallback enabled by default on Raspberry Pi
         self._enable_picamera2 = self._is_raspberry_pi
     
@@ -232,9 +233,33 @@ class AmbientLightMonitor(QThread):
         except (IOError, OSError):
             return False
 
+    @staticmethod
+    def _detect_raspberry_pi_5() -> bool:
+        """Detect specifically Raspberry Pi 5 (BCM2712)."""
+        try:
+            # Check cpuinfo
+            with open('/proc/cpuinfo', 'r') as f:
+                if 'BCM2712' in f.read():
+                    return True
+            
+            # Check kernel release via os.uname() if available
+            if hasattr(os, 'uname'):
+                if 'rpi-2712' in os.uname().release:
+                    return True
+        except Exception:
+            pass
+        return False
+
     def run(self) -> None:
         if self._verbose:
             print("[AutoBrightness] Starting ambient light monitor thread", file=sys.stderr, flush=True)
+
+        # Safety latch: allow disabling camera via environment variable
+        if os.environ.get("NDOT_NO_CAMERA", "").lower() in ("1", "true", "yes"):
+            print("[AutoBrightness] Camera disabled via NDOT_NO_CAMERA environment variable", file=sys.stderr, flush=True)
+            self.errorOccurred.emit("camera_disabled_by_user")
+            return
+
         if np is None:
             print("[AutoBrightness] ERROR: NumPy not available", file=sys.stderr, flush=True)
             self.errorOccurred.emit("missing_backend")
@@ -260,8 +285,8 @@ class AmbientLightMonitor(QThread):
                     error_output = result.stderr.strip()
                     # Проверяем на специфические ошибки numpy/simplejpeg
                     if "numpy.dtype" in error_output and "binary incompatibility" in error_output:
-                        print(f"[AutoBrightness] ERROR: picamera2 numpy/simplejpeg compatibility issue", file=sys.stderr, flush=True)
-                        print(f"[AutoBrightness] Try: pip install --upgrade numpy simplejpeg", file=sys.stderr, flush=True)
+                        print("[AutoBrightness] ERROR: picamera2 numpy/simplejpeg compatibility issue", file=sys.stderr, flush=True)
+                        print("[AutoBrightness] Try: pip install --upgrade numpy simplejpeg", file=sys.stderr, flush=True)
                     else:
                         print(f"[AutoBrightness] ERROR: Picamera2 test failed: {error_output}", file=sys.stderr, flush=True)
                     self.errorOccurred.emit("missing_backend")
@@ -277,6 +302,14 @@ class AmbientLightMonitor(QThread):
         if self._capture:
             self._using_picamera2 = isinstance(self._capture, _Picamera2Adapter)
 
+        # Raspberry Pi 5 prioritization: GStreamer/libcamerasrc is the native way
+        if not self._capture and self._is_pi_5:
+            if self._verbose:
+                print("[AutoBrightness] Raspberry Pi 5 detected, prioritizing GStreamer pipelines", file=sys.stderr, flush=True)
+            self._capture = self._open_raspberry_pi_camera()
+            if self._capture:
+                self._using_picamera2 = False
+
         if not self._capture:
             # Определяем бэкенд в зависимости от платформы
             if os.name == "nt":
@@ -286,7 +319,8 @@ class AmbientLightMonitor(QThread):
                     print("[AutoBrightness] Raspberry Pi detected", file=sys.stderr, flush=True)
                 # Для Raspberry Pi пробуем только V4L2 с индексами
                 # GStreamer требует pipeline, а не индекс, поэтому пробуем его отдельно
-                backends = [cv2.CAP_V4L2, cv2.CAP_ANY]
+                # Avoid CAP_ANY on Pi as it might trigger obsensor crash
+                backends = [cv2.CAP_V4L2]
             else:
                 backends = [cv2.CAP_V4L2, cv2.CAP_ANY]
             
