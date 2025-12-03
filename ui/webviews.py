@@ -40,6 +40,13 @@ class WebviewManager:
         view = self.webview
         return getattr(view, 'page_loaded', False) if view else False
 
+    @page_loaded.setter
+    def page_loaded(self, value: bool):
+        """Backwards compatibility: set current page load status"""
+        view = self.webview
+        if view:
+            view.page_loaded = value
+
     @property
     def error_message(self) -> str:
         """Backwards compatibility: get current error message"""
@@ -50,6 +57,11 @@ class WebviewManager:
     def current_url(self) -> str:
         """Backwards compatibility: get current url key"""
         return self.current_key if self.current_key else ""
+
+    @current_url.setter
+    def current_url(self, value: str):
+        """Backwards compatibility: set current url key"""
+        self.current_key = value if value else None
 
     def _border_radius_px(self) -> int:
         scale = getattr(self.parent, 'scale_factor', 1.0) or 1.0
