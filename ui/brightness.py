@@ -608,8 +608,8 @@ class BrightnessManager(QObject):
             # Apply gamma for better perception
             perceptual_value = math.pow(value, 2.2)
             
-            # Ensure we don't go below 1% for hardware backlight to prevent black screen
-            perceptual_value = max(0.01, perceptual_value)
+            # Ensure we don't go below 15% for hardware backlight to prevent black screen
+            perceptual_value = max(0.15, perceptual_value)
             
             # Log if changed significantly
             if (self._system_backlight_last_ui_log is None or 
