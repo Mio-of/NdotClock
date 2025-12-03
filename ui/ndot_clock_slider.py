@@ -451,15 +451,15 @@ class NDotClockSlider(QWidget):
         self.task_queue.start()
 
     def _restore_window_state(self):
-        """Restore window state (fullscreen/geometry) independent of loading queue."""
+        """Restore window state - ensure fullscreen is properly applied."""
         print(f"[RestoreWindowState] is_fullscreen = {self.is_fullscreen}")
-        if self.is_fullscreen:
-            print("[RestoreWindowState] Calling showFullScreen()")
+        # Only re-apply fullscreen if somehow it was lost (safety net)
+        if self.is_fullscreen and not self.isFullScreen():
+            print("[RestoreWindowState] Re-applying showFullScreen()")
             self.showFullScreen()
+        if self.is_fullscreen:
             self.setFocus(Qt.FocusReason.OtherFocusReason)
-        else:
-            # Restore position if needed
-            pass
+            self.activateWindow()
 
     def _on_brightness_changed(self, value: float):
         """Handle brightness change signal."""
@@ -3081,10 +3081,8 @@ class NDotClockSlider(QWidget):
     def showEvent(self, event):
         """Handle show event to apply fullscreen state"""
         super().showEvent(event)
-        # Apply fullscreen state from settings
+        # Ensure focus for keyboard events (fullscreen is handled in main())
         if self.is_fullscreen:
-            self.showFullScreen()
-            # Set focus to ensure keyboard events are captured in fullscreen
             self.setFocus(Qt.FocusReason.OtherFocusReason)
             self.activateWindow()
 

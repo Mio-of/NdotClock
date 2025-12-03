@@ -107,7 +107,12 @@ def main() -> int:
         qInstallMessageHandler(qt_message_handler)
         
         clock = NDotClockSlider()
-        clock.show()
+        # Use showFullScreen() directly if fullscreen mode is enabled
+        # This prevents flickering on some window managers (especially on RPi)
+        if clock.is_fullscreen:
+            clock.showFullScreen()
+        else:
+            clock.show()
         logger.info("Application initialized successfully")
         return app.exec()
     except Exception as e:
