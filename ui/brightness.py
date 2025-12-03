@@ -564,7 +564,8 @@ class BrightnessManager(QObject):
 
     def _apply_brightness(self, value: float, *, from_auto: bool, animate: bool = True):
         """Apply brightness value to system and UI."""
-        value = max(0.05, min(1.0, value))
+        # Enforce global minimum brightness of 15% in all modes
+        value = max(0.15, min(1.0, value))
         
         if not from_auto:
             self._manual_brightness = value

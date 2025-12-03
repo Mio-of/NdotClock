@@ -4172,13 +4172,12 @@ class NDotClockSlider(QWidget):
     def effective_brightness(self) -> float:
         """
         Effective brightness for rendering.
-        If software overlay is used (no system backlight), this returns 1.0 (max)
-        so that we render full-color elements and dim them via the overlay.
-        This prevents expensive cache thrashing during brightness animations.
+        Always returns 1.0 (max) to disable software pixel dimming.
+        - If hardware backlight exists: it handles dimming globally.
+        - If no hardware backlight: BrightnessOverlay handles dimming globally.
+        Pixel-level scaling causes double-dimming and performance issues.
         """
-        if not self.brightness_manager.has_system_backlight:
-            return 1.0
-        return self.brightness_manager.get_brightness()
+        return 1.0
 
     @user_brightness.setter
     def user_brightness(self, value: float):
