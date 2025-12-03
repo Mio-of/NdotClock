@@ -1,7 +1,10 @@
 """Cross-platform helpers for managing application autostart."""
 
+import logging
 import os
 import sys
+
+logger = logging.getLogger(__name__)
 
 
 def _get_entry_script_path() -> str:
@@ -23,7 +26,11 @@ class AutostartManager:
 
     @staticmethod
     def get_autostart_status() -> bool:
-        """Check if autostart is enabled"""
+        """Check if autostart is enabled.
+        
+        Returns:
+            True if autostart is enabled, False otherwise
+        """
         try:
             if sys.platform == 'win32':
                 return AutostartManager._check_windows_autostart()
@@ -31,39 +38,68 @@ class AutostartManager:
                 return AutostartManager._check_macos_autostart()
             else:  # Linux
                 return AutostartManager._check_linux_autostart()
-        except Exception:
+        except Exception as e:
+            logger.error(f"Failed to check autostart status: {e}")
             return False
 
     @staticmethod
     def enable_autostart() -> bool:
-        """Enable autostart for the application"""
+        """Enable autostart for the application.
+        
+        Returns:
+            True if autostart was enabled successfully, False otherwise
+        """
         try:
+            result = False
             if sys.platform == 'win32':
-                return AutostartManager._enable_windows_autostart()
+                result = AutostartManager._enable_windows_autostart()
             elif sys.platform == 'darwin':
-                return AutostartManager._enable_macos_autostart()
+                result = AutostartManager._enable_macos_autostart()
             else:  # Linux
-                return AutostartManager._enable_linux_autostart()
-        except Exception:
+                result = AutostartManager._enable_linux_autostart()
+            
+            if result:
+                logger.info("Autostart enabled successfully")
+            else:
+                logger.warning("Failed to enable autostart")
+            return result
+        except Exception as e:
+            logger.error(f"Failed to enable autostart: {e}")
             return False
 
     @staticmethod
     def disable_autostart() -> bool:
-        """Disable autostart for the application"""
+        """Disable autostart for the application.
+        
+        Returns:
+            True if autostart was disabled successfully, False otherwise
+        """
         try:
+            result = False
             if sys.platform == 'win32':
-                return AutostartManager._disable_windows_autostart()
+                result = AutostartManager._disable_windows_autostart()
             elif sys.platform == 'darwin':
-                return AutostartManager._disable_macos_autostart()
+                result = AutostartManager._disable_macos_autostart()
             else:  # Linux
-                return AutostartManager._disable_linux_autostart()
-        except Exception:
+                result = AutostartManager._disable_linux_autostart()
+            
+            if result:
+                logger.info("Autostart disabled successfully")
+            else:
+                logger.warning("Failed to disable autostart")
+            return result
+        except Exception as e:
+            logger.error(f"Failed to disable autostart: {e}")
             return False
 
     # Windows implementation
     @staticmethod
     def _check_windows_autostart() -> bool:
-        """Check Windows autostart via registry"""
+        """Check Windows autostart via registry.
+        
+        Returns:
+            True if registry key exists, False otherwise
+        """
         import winreg
         try:
             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
@@ -76,12 +112,17 @@ class AutostartManager:
             except FileNotFoundError:
                 winreg.CloseKey(key)
                 return False
-        except Exception:
+        except OSError as e:
+            logger.debug(f"Failed to check Windows registry: {e}")
             return False
 
     @staticmethod
     def _enable_windows_autostart() -> bool:
-        """Enable Windows autostart via registry"""
+        """Enable Windows autostart via registry.
+        
+        Returns:
+            True if registry key was set successfully, False otherwise
+        """
         import winreg
         try:
             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
@@ -99,8 +140,10 @@ class AutostartManager:
 
             winreg.SetValueEx(key, "NdotClock", 0, winreg.REG_SZ, exe_path)
             winreg.CloseKey(key)
+            logger.debug(f"Set Windows autostart registry key: {exe_path}")
             return True
-        except Exception:
+        except OSError as e:
+            logger.error(f"Failed to set Windows registry: {e}")
             return False
 
     @staticmethod

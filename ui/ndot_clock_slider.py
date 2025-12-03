@@ -79,15 +79,9 @@ from logic import (
 from ui.animations import AnimatedPanel, AnimatedSlideContainer, SlideType
 from ui.controls import ModernColorButton, ModernSlider
 from ui.popups import ConfirmationPopup, DownloadProgressPopup, NotificationPopup
-
-
-class SilentWebEnginePage(QWebEnginePage):
-    """Кастомная страница webview которая подавляет JavaScript логи"""
-    
-    def javaScriptConsoleMessage(self, level, message, lineNumber, sourceID):
-        """Подавляем JavaScript консольные сообщения"""
-        # Игнорируем все JS логи
-        pass
+from ui.brightness import BrightnessManager
+from ui.webviews import WebviewManager
+from ui.settings_manager import SettingsManager
 
 
 class NDotClockSlider(QWidget):
@@ -151,204 +145,44 @@ class NDotClockSlider(QWidget):
                             self.font_family = families[0]
                             break
         
-        # Settings defaults - use platform-specific config directory
-        self.settings_file = os.path.join(self.get_config_dir(), 'ndot_clock_settings.json')
-        self.default_settings = {
-            'user_brightness': 0.8,
-            'digit_color': (246, 246, 255),
-            'background_color': (0, 0, 0),
-            'colon_color': (220, 40, 40),
-            'language': 'RU',
-            'slides': [],
-            'location': {'lat': None, 'lon': None},
-            'auto_brightness_enabled': False,
-            'auto_brightness_camera': 0,
-            'auto_brightness_interval_ms': 1000,  # Быстрее обновления по умолчанию
-            'auto_brightness_min': 0.0,
-            'auto_brightness_max': 1.0,
-        }
+        # Initialize Managers
+        self.settings_manager = SettingsManager(self.get_config_dir())
+        settings = self.settings_manager.load_settings()
+        
+        # State
+        self._manual_brightness = settings['user_brightness']
+        self._digit_color = settings['digit_color']
+        self._background_color = settings['background_color']
+        self._colon_color = settings['colon_color']
+        self.current_language = settings['language']
+        self.slides = settings['slides']
+        self.location_lat = settings['location']['lat']
+        self.location_lon = settings['location']['lon']
+        self.is_fullscreen = settings['fullscreen']
+        
+        # Initialize Brightness Manager
+        self.brightness_manager = BrightnessManager(self, self.settings_manager.default_settings)
+        self.brightness_manager.configure(settings)
+        self.brightness_manager.brightness_changed.connect(self._on_brightness_changed)
+        self.brightness_manager.error_occurred.connect(
+            lambda msg: self.show_notification(msg, notification_type="error")
+        )
+        self.brightness_manager.auto_brightness_toggled.connect(self._on_auto_brightness_toggled)
 
-        self._manual_brightness = self.default_settings['user_brightness']
-        self._auto_brightness_enabled = self.default_settings['auto_brightness_enabled']
-        self._auto_brightness_min = self.default_settings['auto_brightness_min']
-        self._auto_brightness_max = self.default_settings['auto_brightness_max']
-        self._auto_brightness_camera_index = self.default_settings['auto_brightness_camera']
-        self._auto_brightness_interval_ms = self.default_settings['auto_brightness_interval_ms']
-        self._auto_brightness_smoothed = self._manual_brightness
-        self._ambient_light_monitor: Optional[AmbientLightMonitor] = None
-        self._pending_auto_brightness_activation = False
-        self._suppress_auto_brightness_save = False
-        # Улучшенное сглаживание: буфер последних измерений для усреднения
-        self._ambient_brightness_buffer = []
-        self._ambient_brightness_buffer_size = 3  # Короткий буфер для удаления выбросов без потери реакции
-        # Минимальная защита от слишком частых обновлений
-        self._last_brightness_update_time = 0
-        self._min_brightness_update_interval = 0.05  # Минимум 50ms, может быть переопределено через переменную среды
-        self._last_auto_sample_time = 0.0
-        self._auto_brightness_last_interval = self.default_settings['auto_brightness_interval_ms'] / 1000.0
-        self._auto_log_last_measured: Optional[float] = None
-        self._auto_log_last_target: Optional[float] = None
-        self._auto_log_last_smoothed: Optional[float] = None
-        # Анимация яркости с кривой Безье
-        self._brightness_animation_target = self._manual_brightness
-        self._brightness_animation = None  # Будет создана позже после инициализации виджета
-        self._brightness_animation_active = False
-        # Текущее значение яркости дисплея (для автояркости)
-        self._current_display_brightness = self._manual_brightness
-        self.brightness_slider: Optional[ModernSlider] = None
-        self.auto_brightness_checkbox: Optional[QCheckBox] = None
-        self._edit_mode_entry_slide = 0
-        self._system_backlight: Optional[SystemBacklightController] = None
-        self._system_backlight_error_notified = False
-        self._system_backlight_verbose = os.environ.get("NDOT_SYSTEM_BACKLIGHT_VERBOSE", "").lower() in ("1", "true", "yes")
-        self._system_backlight_last_logged_raw: Optional[int] = None
-        self._system_backlight_last_ui_log: Optional[float] = None
-        self._backlight_last_apply_log: Optional[float] = None
-        auto_verbose_env = os.environ.get("NDOT_AUTO_BRIGHTNESS_VERBOSE", "")
-        self._auto_brightness_verbose = auto_verbose_env.lower() in ("1", "true", "yes") or self._system_backlight_verbose
-        gamma_env = os.environ.get("NDOT_AUTO_BRIGHTNESS_GAMMA", "").strip()
-        self._auto_brightness_curve_gamma = 1.8
-        if gamma_env:
-            try:
-                parsed_gamma = float(gamma_env)
-                # Clamp to a sane range to avoid flicker from extreme curves
-                self._auto_brightness_curve_gamma = max(0.3, min(parsed_gamma, 5.0))
-                if self._auto_brightness_verbose:
-                    print(
-                        f"[AutoBrightness] NDOT_AUTO_BRIGHTNESS_GAMMA={parsed_gamma:.3f} -> using {self._auto_brightness_curve_gamma:.3f}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-            except ValueError:
-                if self._auto_brightness_verbose:
-                    print(
-                        f"[AutoBrightness] Invalid NDOT_AUTO_BRIGHTNESS_GAMMA='{gamma_env}', falling back to {self._auto_brightness_curve_gamma:.3f}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-        elif self._auto_brightness_verbose:
-            print(
-                f"[AutoBrightness] Using default brightness gamma {self._auto_brightness_curve_gamma:.3f}",
-                file=sys.stderr,
-                flush=True,
-            )
-        interval_env = os.environ.get("NDOT_AUTO_BRIGHTNESS_INTERVAL_MS", "").strip()
-        self._auto_brightness_interval_override: Optional[int] = None
-        if interval_env:
-            try:
-                parsed_interval = int(float(interval_env))
-                parsed_interval = max(150, min(parsed_interval, 60000))
-                self._auto_brightness_interval_override = parsed_interval
-                if self._auto_brightness_verbose:
-                    print(
-                        f"[AutoBrightness] NDOT_AUTO_BRIGHTNESS_INTERVAL_MS={parsed_interval}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-            except ValueError:
-                if self._auto_brightness_verbose:
-                    print(
-                        f"[AutoBrightness] Invalid NDOT_AUTO_BRIGHTNESS_INTERVAL_MS='{interval_env}', ignoring",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-        self._auto_brightness_smoothing = 0.35
-        smoothing_env = os.environ.get("NDOT_AUTO_BRIGHTNESS_SMOOTHING", "").strip()
-        if smoothing_env:
-            try:
-                parsed_smoothing = float(smoothing_env)
-                self._auto_brightness_smoothing = max(0.0, min(parsed_smoothing, 0.95))
-                if self._auto_brightness_verbose:
-                    print(
-                        f"[AutoBrightness] NDOT_AUTO_BRIGHTNESS_SMOOTHING={self._auto_brightness_smoothing:.3f}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-            except ValueError:
-                if self._auto_brightness_verbose:
-                    print(
-                        f"[AutoBrightness] Invalid NDOT_AUTO_BRIGHTNESS_SMOOTHING='{smoothing_env}', ignoring",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-        min_interval_env = os.environ.get("NDOT_AUTO_BRIGHTNESS_MIN_INTERVAL", "").strip()
-        if min_interval_env:
-            try:
-                parsed_min_interval = float(min_interval_env)
-                self._min_brightness_update_interval = max(0.02, min(parsed_min_interval, 1.0))
-                if self._auto_brightness_verbose:
-                    print(
-                        f"[AutoBrightness] NDOT_AUTO_BRIGHTNESS_MIN_INTERVAL={self._min_brightness_update_interval:.3f}s",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-            except ValueError:
-                if self._auto_brightness_verbose:
-                    print(
-                        f"[AutoBrightness] Invalid NDOT_AUTO_BRIGHTNESS_MIN_INTERVAL='{min_interval_env}', ignoring",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-        self._auto_brightness_min_override: Optional[float] = None
-        self._auto_brightness_max_override: Optional[float] = None
-        min_env = os.environ.get("NDOT_AUTO_BRIGHTNESS_MIN", "").strip()
-        max_env = os.environ.get("NDOT_AUTO_BRIGHTNESS_MAX", "").strip()
-        if min_env:
-            try:
-                parsed_min = float(min_env)
-                self._auto_brightness_min_override = max(0.0, min(parsed_min, 1.0))
-            except ValueError:
-                if self._auto_brightness_verbose:
-                    print(
-                        f"[AutoBrightness] Invalid NDOT_AUTO_BRIGHTNESS_MIN='{min_env}', ignoring",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-        if max_env:
-            try:
-                parsed_max = float(max_env)
-                self._auto_brightness_max_override = max(0.0, min(parsed_max, 1.0))
-            except ValueError:
-                if self._auto_brightness_verbose:
-                    print(
-                        f"[AutoBrightness] Invalid NDOT_AUTO_BRIGHTNESS_MAX='{max_env}', ignoring",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-        if (
-            self._auto_brightness_min_override is not None
-            and self._auto_brightness_max_override is not None
-            and self._auto_brightness_min_override > self._auto_brightness_max_override
-        ):
-            if self._auto_brightness_verbose:
-                print(
-                    "[AutoBrightness] MIN override is greater than MAX override, swapping them",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            self._auto_brightness_min_override, self._auto_brightness_max_override = (
-                self._auto_brightness_max_override,
-                self._auto_brightness_min_override,
-            )
-        calibration_decay_env = os.environ.get("NDOT_AUTO_BRIGHTNESS_CALIBRATION_DECAY", "").strip()
-        self._ambient_calibration_decay = 0.02
-        if calibration_decay_env:
-            try:
-                parsed_decay = float(calibration_decay_env)
-                self._ambient_calibration_decay = max(0.001, min(parsed_decay, 0.2))
-            except ValueError:
-                if self._auto_brightness_verbose:
-                    print(
-                        f"[AutoBrightness] Invalid NDOT_AUTO_BRIGHTNESS_CALIBRATION_DECAY='{calibration_decay_env}', ignoring",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-        self._ambient_dynamic_min: Optional[float] = None
-        self._ambient_dynamic_max: Optional[float] = None
-        self._ambient_calibration_last_log: Optional[Tuple[float, float]] = None
-        self._auto_brightness_has_sample = False
-        self._initialize_system_backlight()
-
+        # Initialize Webview Manager
+        self.webview_manager = WebviewManager(self)
+        
+        # Derived settings
+        self._digit_color_scaled = QColor(self._digit_color)
+        self._colon_color_scaled = QColor(self._colon_color)
+        self._date_color = QColor(self._digit_color)
+        self._date_font_size = 18
+        self._date_gap = 8
+        # Fix: Add LRU limit to prevent memory leak
+        self._dot_pixmap_cache: Dict[Tuple[int, int, bool], QPixmap] = {}
+        self._dot_pixmap_cache_max_size = 200  # LRU limit for dot patterns
+        
+        # UI Setup
         self.setWindowTitle("Ndot Clock")
         self.resize(800, 480)
         self.setMinimumSize(800, 480)
@@ -360,21 +194,10 @@ class NDotClockSlider(QWidget):
         
         # Digit patterns
         self.setup_digit_patterns()
-        
-        # Cached state
-        self._user_brightness = self.default_settings['user_brightness']
-        self._digit_color = QColor(*self.default_settings['digit_color'])
-        self._background_color = QColor(*self.default_settings['background_color'])
-        self._colon_color = QColor(*self.default_settings['colon_color'])
-        self.current_language = self.default_settings['language']
-        self._digit_color_scaled = QColor(self._digit_color)
-        self._colon_color_scaled = QColor(self._colon_color)
-        self._date_color = QColor(self._digit_color)
-        self._date_font_size = 18
-        self._date_gap = 8
-        # Fix: Add LRU limit to prevent memory leak
-        self._dot_pixmap_cache: Dict[Tuple[int, int, bool], QPixmap] = {}
-        self._dot_pixmap_cache_max_size = 200  # LRU limit for dot patterns
+
+        self.brightness_slider: Optional[ModernSlider] = None
+        self.auto_brightness_checkbox: Optional[QCheckBox] = None
+        self._edit_mode_entry_slide = 0
 
         # ARM optimization: Pre-calculate breathing animation lookup table (100 steps)
         self._breathing_lookup = []
@@ -406,7 +229,6 @@ class NDotClockSlider(QWidget):
 
         # State
         self.current_slide = 0
-        self.slides = []
         self.edit_mode = False
         self._edit_transition_active = False
         self._active_edit_animations: Set[QPropertyAnimation] = set()
@@ -416,10 +238,17 @@ class NDotClockSlider(QWidget):
         self._i18n_widgets: Dict[str, List[Tuple[object, str, Dict[str, object]]]] = {}
         self.breathing_time = 0.0
         self.breathing_speed = 0.01
+        self._last_update_second = -1  # Track last second for time change detection
+        self._timer_interval_state = 'normal'  # Track timer interval state
         self.nav_hidden = False
         self.nav_hide_timer = QTimer(self)
         self.nav_hide_timer.timeout.connect(self.hide_navigation)
         self._nav_opacity = 1.0
+        
+        # Clock return timer for auto-return to clock after inactivity
+        self.clock_return_timer = QTimer(self)
+        self.clock_return_timer.setSingleShot(True)
+        self.clock_return_timer.timeout.connect(self.return_to_clock)
 
         # Fix: Swipe smoothing for stable dragging (no throttling, use smoothing instead)
         self._drag_smoothing_alpha = 0.3  # Lower = smoother but more lag, higher = more responsive
@@ -436,21 +265,22 @@ class NDotClockSlider(QWidget):
         self.nav_opacity_animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
         self._edit_panel_ratios: Optional[Tuple[float, float]] = None
         self._youtube_opened_slides: Set[int] = set()  # Track which YouTube slides were auto-opened
-        self.youtube_webview: Optional[QWebEngineView] = None  # Embedded browser for YouTube
-        self.home_assistant_webview: Optional[QWebEngineView] = None  # Embedded browser for Home Assistant
+        # Webviews are now managed by self.webview_manager
         self._webview_mouse_start: Optional[QPoint] = None  # Track mouse start position for swipe detection
         self._active_webview_for_swipe: Optional[QWebEngineView] = None  # Currently swiped webview
         self._active_webview_type: Optional[SlideType] = None
         self._webview_was_transparent = False
-        self._youtube_loaded = False  # Track if YouTube has been loaded
-        self._home_assistant_loaded = False  # Track if Home Assistant has been loaded
         self._youtube_page_loaded = False  # Track if YouTube page finished loading
         self._home_assistant_page_loaded = False  # Track if Home Assistant page finished loading
-        self._youtube_error_message = ""  # исправлено: храним текст ошибки загрузки YouTube
-        self._home_assistant_error_message = ""  # исправлено: храним текст ошибки загрузки Home Assistant
-        self._youtube_error_notified = False  # исправлено: предотвращаем повторные уведомления YouTube
-        self._home_assistant_error_notified = False  # исправлено: предотвращаем повторные уведомления Home Assistant
+        # YouTube state
+        self._youtube_loaded = False
+        self._youtube_error_message = ""
+        self._youtube_error_notified = False
         self._youtube_last_url = ""
+        # Home Assistant state
+        self._home_assistant_loaded = False
+        self._home_assistant_error_message = ""
+        self._home_assistant_error_notified = False
         self._home_assistant_last_url = ""
         self.is_fullscreen = False  # Track fullscreen state
 
@@ -487,6 +317,7 @@ class NDotClockSlider(QWidget):
         # Fix: Add timeout detection for webview load hangs
         self._webview_load_timeouts = {'youtube': False, 'home_assistant': False}
         self._language_control_layout = None  # исправлено: переиспользуем геометрию кнопок языка
+        self._is_new_card = False  # Track if we are creating a new card to handle cancel correctly
         
         # Animation container
         self.slide_container = AnimatedSlideContainer(self)
@@ -512,13 +343,11 @@ class NDotClockSlider(QWidget):
         self.weather_data = None
         self.weather_loading = False
         self.weather_status_message = ""  # For UI feedback on errors
-        self.location_lat = None
-
+        
         # Fix: JSON parser thread for non-blocking parsing
         # Separate threads for location and weather parsing to avoid race conditions
         self.location_parser_thread: Optional[JsonParserThread] = None
         self.weather_parser_thread: Optional[JsonParserThread] = None
-        self.location_lon = None
         self.location_loading = False
 
         # Fix: Cache QFont objects for performance (ARM optimization) with LRU limits
@@ -533,31 +362,10 @@ class NDotClockSlider(QWidget):
         self.panel_opacity_animation = None
         self.panel_scale_animation = None
         self._panel_opacity = 0.0
+
+        # Webview Preload
+        self.webview_manager.create_webview()
         
-        # Load settings and initialize
-        self.load_settings()
-        self._update_cached_colors()
-        self.update_scale_factor()
-        self.calculate_display_parameters()
-        self._apply_language()
-
-        # Initialize default slides
-        if not self.slides:
-            self.slides = [
-                {'type': SlideType.CLOCK, 'data': {}},
-                {'type': SlideType.ADD, 'data': {}}
-            ]
-
-        if self._pending_auto_brightness_activation:
-            QTimer.singleShot(0, self._enable_auto_brightness_from_settings)
-
-        # Create and preload YouTube webview BEFORE showing UI
-        # Note: Webviews must be created before UI shows to prevent resprintering/UI glitches
-        self.create_youtube_webview()
-        self.create_home_assistant_webview()
-        self.preload_youtube_sync()  # Synchronous preload before UI is shown
-        self.preload_home_assistant_sync()
-
         # Fix: Preload SVG weather icons in background for ARM optimization
         self._preload_weather_icons()
 
@@ -566,133 +374,34 @@ class NDotClockSlider(QWidget):
         self.main_timer = QTimer(self)
         self.main_timer.timeout.connect(self.on_timeout)
         self.main_timer.start(16)
-        self._last_update_second = -1  # Track last time update to avoid unnecessary repaints
-        self._timer_interval_state = 'animation'  # 'animation' (16ms), 'breathing' (33ms), 'idle' (1000ms)
-        self._animation_active = False  # Track if any animation is running
-        
+
         # Weather timer
         self.weather_timer = QTimer(self)
         self.weather_timer.timeout.connect(self.fetch_weather)
         self.weather_timer.start(600000)  # 10 minutes
         self.fetch_weather()
 
-        # Update check timer - check for updates 5 seconds after startup (silent)
-        self.update_check_timer = QTimer(self)
-        self.update_check_timer.setSingleShot(True)
-        self.update_check_timer.timeout.connect(lambda: self.update_checker.check_for_updates(silent=True))
-        self.update_check_timer.start(5000)  # 5 seconds delay
 
-        # Clock return timer - return to clock after inactivity
-        self.clock_return_timer = QTimer(self)
-        self.clock_return_timer.setSingleShot(True)
-        self.clock_return_timer.timeout.connect(self.return_to_clock)
-
-        # Navigation inactivity
-        self.reset_navigation_timer()
+    def _on_brightness_changed(self, value: float):
+        """Handle brightness change signal."""
+        self.update()
         
-        # Инициализация анимации яркости с кривой Безье
-        self._init_brightness_animation()
-
-    def _init_brightness_animation(self):
-        """Инициализация анимации яркости с кривой Безье"""
-        self._brightness_animation = QPropertyAnimation(self, b"animatedBrightness")
-        self._brightness_animation.setDuration(800)  # 800ms для плавного перехода
-        self._brightness_animation.setEasingCurve(QEasingCurve.Type.InOutCubic)  # Плавная кубическая кривая Безье
-
-    def _initialize_system_backlight(self):
-        """Configure optional system backlight controller based on environment variables."""
-        config_value = os.environ.get("NDOT_SYSTEM_BACKLIGHT", "").strip()
-        if not config_value:
-            # Если системная подсветка не настроена, пробуем автоопределение
-            # для использования с автояркостью
-            controller = SystemBacklightController.auto_detect()
-            if controller:
-                self._system_backlight = controller
-                if self._system_backlight_verbose:
-                    print(
-                        f"[Backlight] Auto-detected system backlight device '{controller.name}' "
-                        f"(max={controller.max_brightness}) for auto-brightness",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                return
-            else:
-                if self._system_backlight_verbose:
-                    print(
-                        "[Backlight] No system backlight device found. "
-                        "Software brightness only.",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                return
-
-        controller = self._resolve_backlight_controller(config_value)
-        if controller is None:
-            if self._system_backlight_verbose:
-                print(
-                    f"[Backlight] No system backlight matched '{config_value}'. "
-                    "Keep using software brightness.",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            if not self._system_backlight_error_notified:
-                self._system_backlight_error_notified = True
-                QTimer.singleShot(
-                    0,
-                    lambda: self.show_notification(
-                        self._tr("system_backlight_not_found"),
-                        duration=5000,
-                        notification_type="warning",
-                    ),
-                )
-            return
-
-        self._system_backlight = controller
-        if self._system_backlight_verbose:
-            print(
-                f"[Backlight] Using system backlight device '{controller.name}' "
-                f"(max={controller.max_brightness})",
-                file=sys.stderr,
-                flush=True,
-            )
-
-    def _resolve_backlight_controller(
-        self, config_value: str
-    ) -> Optional[SystemBacklightController]:
-        """Resolve backlight device from configuration string."""
-        parts = [part.strip() for part in config_value.split(",") if part.strip()]
-        if not parts:
-            parts = ["auto"]
-
-        for part in parts:
-            lowered = part.lower()
-            if lowered in ("auto", "detect", "default"):
-                controller = SystemBacklightController.auto_detect()
-                if controller:
-                    return controller
-                continue
-
-            candidate_dir = part
-            if not os.path.isdir(candidate_dir):
-                candidate_dir = os.path.join("/sys/class/backlight", part)
-            if os.path.isdir(candidate_dir):
-                controller = SystemBacklightController.from_directory(candidate_dir)
-                if controller:
-                    return controller
-
-        return None
-    
-    @pyqtProperty(float)
-    def animatedBrightness(self):
-        """Свойство для анимации яркости"""
-        return self._brightness_animation_target
-    
-    @animatedBrightness.setter
-    def animatedBrightness(self, value: float):
-        """Setter для анимированной яркости - вызывается анимацией"""
-        self._brightness_animation_target = value
-        # Применяем яркость без дополнительной анимации
-        self._apply_brightness_direct(value)
+        # Sync slider if needed (without signaling)
+        if self.brightness_slider:
+            self.brightness_slider.blockSignals(True)
+            self.brightness_slider.setValue(int(value * 100))
+            self.brightness_slider.blockSignals(False)
+            
+    def _on_auto_brightness_toggled(self, enabled: bool):
+        """Handle auto-brightness toggle."""
+        if self.auto_brightness_checkbox:
+            self.auto_brightness_checkbox.blockSignals(True)
+            self.auto_brightness_checkbox.setChecked(enabled)
+            self.auto_brightness_checkbox.blockSignals(False)
+            
+        if self.brightness_slider:
+            self.brightness_slider.setEnabled(not enabled)
+            self.brightness_slider.update()
 
     def setup_digit_patterns(self):
         """Setup 3x5 digit patterns"""
@@ -1969,10 +1678,8 @@ class NDotClockSlider(QWidget):
                 self.open_weather_editor()
             elif slide['type'] == SlideType.CUSTOM:
                 self.open_custom_editor(self.current_slide)
-            elif slide['type'] == SlideType.YOUTUBE:
-                self.open_youtube_editor(self.current_slide)
-            elif slide['type'] == SlideType.HOME_ASSISTANT:
-                self.open_home_assistant_editor(self.current_slide)
+            elif slide['type'] == SlideType.WEBVIEW:
+                self.open_webview_editor(self.current_slide)
 
             return True
         
@@ -1981,6 +1688,7 @@ class NDotClockSlider(QWidget):
     def show_add_menu(self):
         """Show menu to add new cards"""
         self.card_edit_mode = True
+        self.hide_all_webviews()
         self._clear_i18n_widgets()
         self.active_panel_type = ("add_menu", None)
         self.setup_add_menu_panel()
@@ -2050,17 +1758,11 @@ class NDotClockSlider(QWidget):
         custom_btn.clicked.connect(self.add_custom_card)
         layout.addWidget(custom_btn)
 
-        # YouTube button
-        youtube_btn = QPushButton()
-        self._register_i18n_widget(youtube_btn, "youtube_button")
-        youtube_btn.clicked.connect(self.add_youtube)
-        layout.addWidget(youtube_btn)
-
-        # Home Assistant button
-        ha_btn = QPushButton()
-        self._register_i18n_widget(ha_btn, "ha_button")
-        ha_btn.clicked.connect(self.add_home_assistant)
-        layout.addWidget(ha_btn)
+        # Webview button
+        webview_btn = QPushButton()
+        self._register_i18n_widget(webview_btn, "webview_button")
+        webview_btn.clicked.connect(self.add_webview)
+        layout.addWidget(webview_btn)
 
         # Cancel button
         cancel_btn = QPushButton()
@@ -2109,7 +1811,7 @@ class NDotClockSlider(QWidget):
             data.setdefault(key, value)
         return data
 
-    def save_weather_settings(self):
+    def save_weather_settings(self, checked=False):
         """Persist weather slide configuration"""
         if self.current_edit_index is None or not (0 <= self.current_edit_index < len(self.slides)):
             self.exit_card_edit_mode()
@@ -2125,12 +1827,13 @@ class NDotClockSlider(QWidget):
         slide_data['show_icon'] = self.show_icon_cb.isChecked()
         slide_data['show_desc'] = self.show_desc_cb.isChecked()
         slide_data['show_wind'] = self.show_wind_cb.isChecked()
-
+        
+        self._is_new_card = False  # Confirmed creation/edit
         self.save_settings()
         self.update()
         self.exit_card_edit_mode()
 
-    def add_weather_widget(self):
+    def add_weather_widget(self, checked=False):
         """Add weather widget card"""
         has_weather = any(s['type'] == SlideType.WEATHER for s in self.slides)
         if not has_weather:
@@ -2139,10 +1842,11 @@ class NDotClockSlider(QWidget):
             self.slides.insert(add_index, {'type': SlideType.WEATHER, 'data': self._default_weather_data()})
             self.current_slide = add_index
             self.save_settings()
+            self._is_new_card = True  # Flag as new card
         self.exit_card_edit_mode()
 
-    def add_custom_card(self):
-        """Add custom text card"""
+    def add_custom_card(self, checked=False):
+        """Add custom card"""
         # Insert before the ADD card
         add_index = len(self.slides) - 1
         self.slides.insert(add_index, {
@@ -2151,61 +1855,48 @@ class NDotClockSlider(QWidget):
         })
         self.current_slide = add_index
         self.save_settings()
-        self.exit_card_edit_mode()
+        self._is_new_card = True  # Flag as new card
+        
         # Open editor immediately
         self.card_edit_mode = True
+        self.hide_all_webviews()
         self.current_edit_index = add_index
         self._clear_i18n_widgets()
         self.setup_custom_edit_panel()
 
-    def add_youtube(self):
-        """Add YouTube card"""
+    def add_webview(self, checked=False):
+        """Add new webview card"""
         # Insert before the ADD card
         add_index = len(self.slides) - 1
         self.slides.insert(add_index, {
-            'type': SlideType.YOUTUBE,
+            'type': SlideType.WEBVIEW,
             'data': {
-                'url': 'https://www.youtube.com/',
-                'title': self._tr('youtube_default_title')
+                'url': 'https://google.com',
+                'title': self._tr('webview_default_title')
             }
         })
         self.current_slide = add_index
         self.save_settings()
-        self.exit_card_edit_mode()
+        self._is_new_card = True  # Flag as new card
+        
         # Open editor immediately
         self.card_edit_mode = True
+        self.hide_all_webviews()
         self.current_edit_index = add_index
         self._clear_i18n_widgets()
-        self.setup_youtube_edit_panel()
-
-    def add_home_assistant(self):
-        """Add Home Assistant card"""
-        add_index = len(self.slides) - 1
-        self.slides.insert(add_index, {
-            'type': SlideType.HOME_ASSISTANT,
-            'data': {
-                'url': 'http://homeassistant.local:8123/',
-                'title': self._tr('ha_default_title')
-            }
-        })
-        self.current_slide = add_index
-        self.save_settings()
-        self.exit_card_edit_mode()
-        # Open editor immediately
-        self.card_edit_mode = True
-        self.current_edit_index = add_index
-        self._clear_i18n_widgets()
-        self.setup_home_assistant_edit_panel()
+        self.setup_webview_edit_panel()
 
     def open_clock_editor(self):
         """Open clock editor panel"""
         self.card_edit_mode = True
+        self.hide_all_webviews()
         self._clear_i18n_widgets()
         self.setup_clock_edit_panel()
 
     def open_weather_editor(self):
         """Open weather editor panel"""
         self.card_edit_mode = True
+        self.hide_all_webviews()
         self.current_edit_index = self.current_slide
         self._clear_i18n_widgets()
         self.setup_weather_edit_panel()
@@ -2213,23 +1904,18 @@ class NDotClockSlider(QWidget):
     def open_custom_editor(self, index: int):
         """Open custom slide editor"""
         self.card_edit_mode = True
+        self.hide_all_webviews()
         self.current_edit_index = index
         self._clear_i18n_widgets()
         self.setup_custom_edit_panel()
 
-    def open_youtube_editor(self, index: int):
-        """Open YouTube slide editor"""
+    def open_webview_editor(self, index: int):
+        """Open universal webview slide editor"""
         self.card_edit_mode = True
+        self.hide_all_webviews()
         self.current_edit_index = index
         self._clear_i18n_widgets()
-        self.setup_youtube_edit_panel()
-
-    def open_home_assistant_editor(self, index: int):
-        """Open Home Assistant slide editor"""
-        self.card_edit_mode = True
-        self.current_edit_index = index
-        self._clear_i18n_widgets()
-        self.setup_home_assistant_edit_panel()
+        self.setup_webview_edit_panel()
 
     def setup_clock_edit_panel(self):
         """Create clock editor panel"""
@@ -2343,7 +2029,7 @@ class NDotClockSlider(QWidget):
         buttons_row.addStretch()
         layout.addLayout(buttons_row)
 
-    def save_clock_settings(self):
+    def save_clock_settings(self, checked=False):
         """Commit clock settings and close the panel"""
         self.save_settings()
         self.exit_card_edit_mode()
@@ -2529,18 +2215,19 @@ class NDotClockSlider(QWidget):
         buttons_row.addStretch()
         layout.addLayout(buttons_row)
 
-    def save_custom_slide(self):
+    def save_custom_slide(self, checked=False):
         """Save custom slide content"""
         if hasattr(self, 'custom_text_edit'):
             text = self.custom_text_edit.toPlainText()
             self.slides[self.current_edit_index]['data']['text'] = text
+            self._is_new_card = False  # Confirmed creation/edit
             self.save_settings()
         self.exit_card_edit_mode()
 
-    def setup_youtube_edit_panel(self):
-        """Create YouTube editor panel"""
-        self.active_panel_type = ("youtube", self.current_edit_index)
-        _, layout = self._create_settings_panel("youtube_editor_title", width_ratio=0.55, height_ratio=0.65)
+    def setup_webview_edit_panel(self):
+        """Create universal webview editor panel"""
+        self.active_panel_type = ("webview", self.current_edit_index)
+        _, layout = self._create_settings_panel("webview_editor_title", width_ratio=0.55, height_ratio=0.65)
 
         layout.addSpacing(self.get_spacing(8, 4))
 
@@ -2551,16 +2238,16 @@ class NDotClockSlider(QWidget):
         url_label.setStyleSheet(f"color: #ccc; font-size: {url_label_font_size}px; font-family: '{self.font_family}';")
         layout.addWidget(url_label)
 
-        self.youtube_url_input = QLineEdit()
-        self.youtube_url_input.setText(
+        self.webview_url_input = QLineEdit()
+        self.webview_url_input.setText(
             self.slides[self.current_edit_index]['data'].get('url', '')
         )
         input_height = self.get_ui_size(32, 26)
         input_font_size = self.get_ui_size(12, 10)
         input_padding = self.get_ui_size(8, 6)
         input_radius = self.get_ui_size(6, 4)
-        self.youtube_url_input.setMinimumHeight(input_height)
-        self.youtube_url_input.setStyleSheet(f"""
+        self.webview_url_input.setMinimumHeight(input_height)
+        self.webview_url_input.setStyleSheet(f"""
             QLineEdit {{
                 background-color: rgba(255, 255, 255, 8);
                 border: 1px solid rgba(255, 255, 255, 20);
@@ -2571,7 +2258,7 @@ class NDotClockSlider(QWidget):
                 font-family: '{self.font_family}';
             }}
         """)
-        layout.addWidget(self.youtube_url_input)
+        layout.addWidget(self.webview_url_input)
 
         layout.addSpacing(self.get_spacing(12, 8))
 
@@ -2581,12 +2268,12 @@ class NDotClockSlider(QWidget):
         title_label.setStyleSheet(f"color: #ccc; font-size: {url_label_font_size}px; font-family: '{self.font_family}';")
         layout.addWidget(title_label)
 
-        self.youtube_title_input = QLineEdit()
-        self.youtube_title_input.setText(
+        self.webview_title_input = QLineEdit()
+        self.webview_title_input.setText(
             self.slides[self.current_edit_index]['data'].get('title', self._tr('youtube_default_title'))
         )
-        self.youtube_title_input.setMinimumHeight(input_height)
-        self.youtube_title_input.setStyleSheet(f"""
+        self.webview_title_input.setMinimumHeight(input_height)
+        self.webview_title_input.setStyleSheet(f"""
             QLineEdit {{
                 background-color: rgba(255, 255, 255, 8);
                 border: 1px solid rgba(255, 255, 255, 20);
@@ -2597,7 +2284,7 @@ class NDotClockSlider(QWidget):
                 font-family: '{self.font_family}';
             }}
         """)
-        layout.addWidget(self.youtube_title_input)
+        layout.addWidget(self.webview_title_input)
 
         layout.addStretch()
 
@@ -2641,148 +2328,28 @@ class NDotClockSlider(QWidget):
         save_btn = QPushButton()
         save_btn.setProperty("buttonRole", "primary")
         self._register_i18n_widget(save_btn, "save_button")
-        save_btn.clicked.connect(self.save_youtube)
+        save_btn.clicked.connect(self.save_webview)
         buttons_row.addWidget(save_btn)
 
         buttons_row.addStretch()
         layout.addLayout(buttons_row)
 
-    def setup_home_assistant_edit_panel(self):
-        """Create Home Assistant editor panel"""
-        self.active_panel_type = ("home_assistant", self.current_edit_index)
-        _, layout = self._create_settings_panel("ha_editor_title", width_ratio=0.55, height_ratio=0.65)
 
-        layout.addSpacing(self.get_spacing(8, 4))
-
-        # URL input
-        url_label = QLabel()
-        self._register_i18n_widget(url_label, "ha_url_label")
-        url_label_font_size = self.get_ui_size(12, 10)
-        url_label.setStyleSheet(f"color: #ccc; font-size: {url_label_font_size}px; font-family: '{self.font_family}';")
-        layout.addWidget(url_label)
-
-        self.ha_url_input = QLineEdit()
-        self.ha_url_input.setText(
-            self.slides[self.current_edit_index]['data'].get('url', 'http://homeassistant.local:8123/')
-        )
-        input_height = self.get_ui_size(32, 26)
-        input_font_size = self.get_ui_size(12, 10)
-        input_padding = self.get_ui_size(8, 6)
-        input_radius = self.get_ui_size(6, 4)
-        self.ha_url_input.setMinimumHeight(input_height)
-        self.ha_url_input.setStyleSheet(f"""
-            QLineEdit {{
-                background-color: rgba(255, 255, 255, 8);
-                border: 1px solid rgba(255, 255, 255, 20);
-                border-radius: {input_radius}px;
-                padding: {input_padding}px;
-                color: #f0f0f0;
-                font-size: {input_font_size}px;
-                font-family: '{self.font_family}';
-            }}
-        """)
-        layout.addWidget(self.ha_url_input)
-
-        layout.addSpacing(self.get_spacing(12, 8))
-
-        # Title input
-        title_label = QLabel()
-        self._register_i18n_widget(title_label, "ha_title_label")
-        title_label.setStyleSheet(f"color: #ccc; font-size: {url_label_font_size}px; font-family: '{self.font_family}';")
-        layout.addWidget(title_label)
-
-        self.ha_title_input = QLineEdit()
-        self.ha_title_input.setText(
-            self.slides[self.current_edit_index]['data'].get('title', self._tr('ha_default_title'))
-        )
-        self.ha_title_input.setMinimumHeight(input_height)
-        self.ha_title_input.setStyleSheet(f"""
-            QLineEdit {{
-                background-color: rgba(255, 255, 255, 8);
-                border: 1px solid rgba(255, 255, 255, 20);
-                border-radius: {input_radius}px;
-                padding: {input_padding}px;
-                color: #f0f0f0;
-                font-size: {input_font_size}px;
-                font-family: '{self.font_family}';
-            }}
-        """)
-        layout.addWidget(self.ha_title_input)
-
-        layout.addStretch()
-
-        buttons_row = QHBoxLayout()
-        buttons_row.setSpacing(max(6, int(8 * self.scale_factor)))
-        buttons_row.addStretch()
-
-        delete_btn = QPushButton()
-        delete_btn.setProperty("buttonRole", "delete")
-        btn_font_size = self.get_ui_size(12, 10)
-        btn_padding_v = self.get_ui_size(8, 6)
-        btn_padding_h = self.get_ui_size(16, 12)
-        btn_radius = self.get_ui_size(8, 6)
-        btn_min_w = self.get_ui_size(75, 60)
-        btn_min_h = self.get_ui_size(32, 26)
-        delete_btn.setStyleSheet(f"""
-            QPushButton[buttonRole="delete"] {{
-                background-color: #dc3545;
-                color: white;
-                border: none;
-                border-radius: {btn_radius}px;
-                padding: {btn_padding_v}px {btn_padding_h}px;
-                font-weight: 600;
-                font-size: {btn_font_size}px;
-                min-width: {btn_min_w}px;
-                min-height: {btn_min_h}px;
-                font-family: '{self.font_family}';
-            }}
-        """)
-        self._register_i18n_widget(delete_btn, "delete_button")
-        delete_btn.clicked.connect(self.confirm_delete_card)
-        buttons_row.addWidget(delete_btn)
-
-        cancel_btn = QPushButton()
-        cancel_btn.setProperty("buttonRole", "secondary")
-        self._register_i18n_widget(cancel_btn, "cancel_button")
-        cancel_btn.clicked.connect(self.exit_card_edit_mode)
-        buttons_row.addWidget(cancel_btn)
-
-        save_btn = QPushButton()
-        save_btn.setProperty("buttonRole", "primary")
-        self._register_i18n_widget(save_btn, "save_button")
-        save_btn.clicked.connect(self.save_home_assistant)
-        buttons_row.addWidget(save_btn)
-
-        buttons_row.addStretch()
-        layout.addLayout(buttons_row)
-
-    def save_home_assistant(self):
-        """Persist Home Assistant slide data"""
-        if hasattr(self, 'ha_url_input') and hasattr(self, 'ha_title_input'):
-            url = self.ha_url_input.text()
-            title = self.ha_title_input.text() or self._tr('ha_default_title')
-            slide = self.slides[self.current_edit_index]
-            slide_data = slide.setdefault('data', {})
-            slide_data['url'] = url or 'http://homeassistant.local:8123/'
-            slide_data['title'] = title
-            self.save_settings()
-            self._home_assistant_loaded = False
-            self._home_assistant_page_loaded = False
-        self.exit_card_edit_mode()
-
-    def save_youtube(self):
-        """Save YouTube slide content"""
-        if hasattr(self, 'youtube_url_input') and hasattr(self, 'youtube_title_input'):
-            url = self.youtube_url_input.text()
-            title = self.youtube_title_input.text()
+    def save_webview(self, checked=False):
+        """Save webview slide content"""
+        if hasattr(self, 'webview_url_input') and hasattr(self, 'webview_title_input'):
+            url = self.webview_url_input.text()
+            title = self.webview_title_input.text()
             self.slides[self.current_edit_index]['data']['url'] = url
             self.slides[self.current_edit_index]['data']['title'] = title
+            self._is_new_card = False  # Confirmed creation/edit
             self.save_settings()
-            self._youtube_loaded = False
-            self._youtube_page_loaded = False
+            # Reset webview state
+            self.webview_manager.page_loaded = False
+            self.webview_manager.current_url = ""
         self.exit_card_edit_mode()
 
-    def confirm_delete_card(self):
+    def confirm_delete_card(self, checked=False):
         """Show confirmation dialog for deleting a card"""
         if self.current_edit_index is None or self.current_edit_index >= len(self.slides):
             return
@@ -2823,8 +2390,18 @@ class NDotClockSlider(QWidget):
         self.update()
         self.update_active_webviews()
 
-    def exit_card_edit_mode(self):
-        """Exit card edit mode"""
+    def exit_card_edit_mode(self, _checked=None):
+        """Exit card edit mode. _checked parameter absorbs Qt button signal."""
+        
+        # Handle cancellation of new card creation
+        if self._is_new_card and self.current_edit_index is not None:
+            if 0 <= self.current_edit_index < len(self.slides):
+                del self.slides[self.current_edit_index]
+                if self.current_slide >= len(self.slides):
+                    self.current_slide = max(0, len(self.slides) - 1)
+                self.save_settings()
+        self._is_new_card = False
+
         def cleanup_panel():
             self._cleanup_panel_animations()
             if self.edit_panel:
@@ -2965,55 +2542,52 @@ class NDotClockSlider(QWidget):
 
     def eventFilter(self, obj, event):
         """Filter events from webview to detect swipes"""
-        tracked_webviews = [
-            (self.youtube_webview, SlideType.YOUTUBE),
-            (self.home_assistant_webview, SlideType.HOME_ASSISTANT)
-        ]
+        # Check if event is from the universal webview
+        if (self.webview_manager.webview and 
+            obj == self.webview_manager.webview and 
+            self.webview_manager.webview.isVisible()):
+            
+            webview = self.webview_manager.webview
+            
+            if event.type() == QEvent.Type.MouseButtonPress:
+                self._webview_mouse_start = event.pos()
+                self._active_webview_for_swipe = webview
+                self._active_webview_type = SlideType.WEBVIEW
+                self._webview_was_transparent = False
+                return False
 
-        for webview, webview_type in tracked_webviews:
-            if webview is None:
-                continue
+            if event.type() == QEvent.Type.MouseMove and self._webview_mouse_start is not None:
+                delta_x = event.pos().x() - self._webview_mouse_start.x()
+                delta_y = event.pos().y() - self._webview_mouse_start.y()
 
-            if obj == webview and webview.isVisible():
-                if event.type() == QEvent.Type.MouseButtonPress:
-                    self._webview_mouse_start = event.pos()
-                    self._active_webview_for_swipe = webview
-                    self._active_webview_type = webview_type
-                    self._webview_was_transparent = False
-                    return False
+                if abs(delta_x) > 15 and abs(delta_x) > abs(delta_y) * 1.8:
+                    if not self._webview_was_transparent:
+                        webview.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+                        self._webview_was_transparent = True
 
-                if event.type() == QEvent.Type.MouseMove and self._webview_mouse_start is not None:
-                    delta_x = event.pos().x() - self._webview_mouse_start.x()
-                    delta_y = event.pos().y() - self._webview_mouse_start.y()
-
-                    if abs(delta_x) > 15 and abs(delta_x) > abs(delta_y) * 1.8:
-                        if not self._webview_was_transparent:
-                            webview.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-                            self._webview_was_transparent = True
-
-                            parent_pos = webview.mapToParent(self._webview_mouse_start)
-                            new_press = QMouseEvent(
-                                QMouseEvent.Type.MouseButtonPress,
-                                parent_pos,
-                                event.button(),
-                                Qt.MouseButton.LeftButton,
-                                event.modifiers()
-                            )
-                            QApplication.sendEvent(self, new_press)
-                        return False
-
-                    return False
-
-                if event.type() == QEvent.Type.MouseButtonRelease:
-                    self._webview_mouse_start = None
-                    self._active_webview_for_swipe = None
-                    self._active_webview_type = None
-                    if self._webview_was_transparent:
-                        QTimer.singleShot(100, lambda w=webview: self._restore_webview_interactivity(w))
-                        self._webview_was_transparent = False
+                        parent_pos = webview.mapToParent(self._webview_mouse_start)
+                        new_press = QMouseEvent(
+                            QMouseEvent.Type.MouseButtonPress,
+                            parent_pos,
+                            event.button(),
+                            Qt.MouseButton.LeftButton,
+                            event.modifiers()
+                        )
+                        QApplication.sendEvent(self, new_press)
                     return False
 
                 return False
+
+            if event.type() == QEvent.Type.MouseButtonRelease:
+                self._webview_mouse_start = None
+                self._active_webview_for_swipe = None
+                self._active_webview_type = None
+                if self._webview_was_transparent:
+                    QTimer.singleShot(100, lambda w=webview: self._restore_webview_interactivity(w))
+                    self._webview_was_transparent = False
+                return False
+
+            return False
 
         return super().eventFilter(obj, event)
 
@@ -3021,327 +2595,55 @@ class NDotClockSlider(QWidget):
         """Return slide type for a given webview instance"""
         if webview is None:
             return None
-        if webview == self.youtube_webview:
-            return SlideType.YOUTUBE
-        if webview == self.home_assistant_webview:
-            return SlideType.HOME_ASSISTANT
+        if webview == self.webview_manager.webview:
+            return SlideType.WEBVIEW
         return None
 
     def _restore_webview_interactivity(self, webview: Optional[QWebEngineView] = None):
         """Restore webview interactivity after swipe"""
         webview = webview or self._active_webview_for_swipe
-        if webview is None or not webview.isVisible():
+        if webview is None:
             return
 
         slide_type = self._get_webview_type(webview)
         if slide_type is None:
             return
 
+        # Only restore if we're still on a webview slide
         if 0 <= self.current_slide < len(self.slides):
             slide = self.slides[self.current_slide]
             if slide['type'] == slide_type:
                 webview.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
 
-    def create_youtube_webview(self):
-        """Create embedded YouTube web view
 
-        WARNING: WebView components consume significant memory (50-150MB per instance).
-        Consider lazy loading instead of preloading if memory is constrained.
-        """
-        if self.youtube_webview is None:
-            # Create a named persistent profile BEFORE creating the webview
-            # The profile name makes it persistent, and storage path must be set before use
-            cookies_dir = os.path.join(self.get_config_dir(), "cookies")
-            os.makedirs(cookies_dir, exist_ok=True)
+    def show_webview(self, url: str):
+        """Show webview with URL"""
+        # Don't show in edit modes
+        if self.edit_mode or self.card_edit_mode:
+            return False
+            
+        # Load URL (will skip if already loaded)
+        self.webview_manager.load_url(url)
+            
+        # Get current webview slide geometry
+        webview_slide_index = self.get_slide_index_for_type(SlideType.WEBVIEW)
+        if webview_slide_index >= 0 and webview_slide_index == self.current_slide:
+            geom = self.get_embedded_card_geometry(webview_slide_index)
+            # Show webview (will handle loading state internally)
+            return self.webview_manager.show_webview(geom)
+        return False
 
-            # Create named profile with persistent storage
-            profile = QWebEngineProfile("youtube_profile", self)
-            profile.setPersistentStoragePath(cookies_dir)
-            profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.AllowPersistentCookies)
+    def hide_webview(self):
+        """Hide webview"""
+        self.webview_manager.hide_webview()
 
-            # Create page with the persistent profile
-            page = SilentWebEnginePage(profile, self)
-
-            # Create webview and set the page with persistent profile
-            self.youtube_webview = QWebEngineView(self)
-            self.youtube_webview.setPage(page)
-            self.youtube_webview.hide()
-
-            # Add opacity effect for fade-in animation
-            opacity_effect = QGraphicsOpacityEffect(self.youtube_webview)
-            opacity_effect.setOpacity(0.0)  # Start invisible
-            self.youtube_webview.setGraphicsEffect(opacity_effect)
-            self.youtube_webview.opacity_effect = opacity_effect
-
-            # Connect loadFinished signal to detect page load completion
-            self.youtube_webview.loadFinished.connect(self.on_youtube_load_finished)
-
-            # Configure WebEngine settings to allow storage access
-            settings = self.youtube_webview.settings()
-            settings.setAttribute(QWebEngineSettings.WebAttribute.LocalStorageEnabled, True)
-            settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
-            settings.setAttribute(QWebEngineSettings.WebAttribute.AllowRunningInsecureContent, False)
-            settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
-            settings.setAttribute(QWebEngineSettings.WebAttribute.PluginsEnabled, True)
-
-            # Set page background color to white to avoid black screen
-            self.youtube_webview.page().setBackgroundColor(QColor(255, 255, 255))
-
-            # Install event filter to detect swipes
-            self.youtube_webview.installEventFilter(self)
-            # Apply rounded corners styling
-            border_radius = int(16 * self.scale_factor)
-            self.youtube_webview.setStyleSheet(f"""
-                QWebEngineView {{
-                    border-radius: {border_radius}px;
-                    background: white;
-                }}
-            """)
-            # Prevent webview from intercepting mouse events when hidden
-            self.youtube_webview.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-
-    def create_home_assistant_webview(self):
-        """Create embedded Home Assistant web view
-
-        WARNING: WebView components consume significant memory (50-150MB per instance).
-        Consider lazy loading instead of preloading if memory is constrained.
-        """
-        if self.home_assistant_webview is None:
-            # Create a named persistent profile BEFORE creating the webview
-            # The profile name makes it persistent, and storage path must be set before use
-            cookies_dir = os.path.join(self.get_config_dir(), "cookies")
-            os.makedirs(cookies_dir, exist_ok=True)
-
-            # Create named profile with persistent storage
-            profile = QWebEngineProfile("home_assistant_profile", self)
-            profile.setPersistentStoragePath(cookies_dir)
-            profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.AllowPersistentCookies)
-
-            # Create page with the persistent profile
-            page = SilentWebEnginePage(profile, self)
-
-            # Create webview and set the page with persistent profile
-            self.home_assistant_webview = QWebEngineView(self)
-            self.home_assistant_webview.setPage(page)
-            self.home_assistant_webview.hide()
-
-            # Add opacity effect for fade-in animation
-            opacity_effect = QGraphicsOpacityEffect(self.home_assistant_webview)
-            opacity_effect.setOpacity(0.0)  # Start invisible
-            self.home_assistant_webview.setGraphicsEffect(opacity_effect)
-            self.home_assistant_webview.opacity_effect = opacity_effect
-
-            # Connect loadFinished signal to detect page load completion
-            self.home_assistant_webview.loadFinished.connect(self.on_home_assistant_load_finished)
-
-            settings = self.home_assistant_webview.settings()
-            settings.setAttribute(QWebEngineSettings.WebAttribute.LocalStorageEnabled, True)
-            settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
-            settings.setAttribute(QWebEngineSettings.WebAttribute.AllowRunningInsecureContent, True)
-            settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
-            settings.setAttribute(QWebEngineSettings.WebAttribute.PluginsEnabled, True)
-
-            # Set page background color to white to avoid black screen
-            self.home_assistant_webview.page().setBackgroundColor(QColor(255, 255, 255))
-
-            self.home_assistant_webview.installEventFilter(self)
-            border_radius = int(16 * self.scale_factor)
-            self.home_assistant_webview.setStyleSheet(f"""
-                QWebEngineView {{
-                    border-radius: {border_radius}px;
-                    background: white;
-                }}
-            """)
-            self.home_assistant_webview.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-
-    def _prepare_url(self, raw_url: str, *, default_scheme: str) -> Optional[QUrl]:
-        """Normalize user-provided URL before loading it into webviews."""
-        url_text = (raw_url or "").strip()
-        if not url_text:
-            return None
-
-        url = QUrl(url_text)
-        if not url.isValid() or not url.scheme():
-            url = QUrl(f"{default_scheme}://{url_text}")
-
-        if not url.isValid() or url.scheme().lower() not in {"http", "https"}:
-            return None
-
-        return url
-
-    def preload_youtube_sync(self):
-        """Preload YouTube synchronously before UI is shown"""
-        if self.youtube_webview and not self._youtube_loaded:
-            # Find YouTube URL from slides
-            youtube_url = None
-            for slide in self.slides:
-                if slide['type'] == SlideType.YOUTUBE:
-                    youtube_url = slide['data'].get('url', 'https://www.youtube.com/')
-                    break
-
-            url_object = self._prepare_url(youtube_url or "", default_scheme="https")
-            if url_object:
-                self._youtube_last_url = url_object.toString()
-                self._youtube_error_notified = False
-                # Load URL while keeping webview hidden off-screen
-                self.youtube_webview.setGeometry(-10000, -10000, 100, 100)
-                # Set timeout for page load (10 seconds)
-                QTimer.singleShot(10000, lambda: self._check_youtube_load_timeout())
-                self.youtube_webview.setUrl(url_object)
-                self._youtube_loaded = True
-                self._youtube_error_message = ""
-            else:
-                self._youtube_error_message = self._tr("webview_error")  # исправлено: сохраняем ошибку при некорректном URL
-                self._youtube_loaded = False
-                self._youtube_error_notified = False
-                self._youtube_last_url = youtube_url or ""
-
-    def preload_home_assistant_sync(self):
-        """Preload Home Assistant synchronously before UI is shown"""
-        if self.home_assistant_webview and not self._home_assistant_loaded:
-            ha_url = None
-            for slide in self.slides:
-                if slide['type'] == SlideType.HOME_ASSISTANT:
-                    ha_url = slide['data'].get('url', 'http://homeassistant.local:8123/')
-                    break
-
-            url_object = self._prepare_url(ha_url or "", default_scheme="http")
-            if url_object:
-                self._home_assistant_last_url = url_object.toString()
-                self._home_assistant_error_notified = False
-                self.home_assistant_webview.setGeometry(-10000, -10000, 100, 100)
-                # Set timeout for page load (10 seconds)
-                QTimer.singleShot(10000, lambda: self._check_home_assistant_load_timeout())
-                self.home_assistant_webview.setUrl(url_object)
-                self._home_assistant_loaded = True
-                self._home_assistant_error_message = ""
-            else:
-                self._home_assistant_error_message = self._tr("webview_error")  # исправлено: сохраняем ошибку для отображения на карточке
-                self._home_assistant_loaded = False
-                self._home_assistant_error_notified = False
-                self._home_assistant_last_url = ha_url or ""
-
-    def show_youtube_webview(self, url: str):
-        """Show YouTube webview with URL inside the card"""
-        if not self.youtube_webview:
-            return
-
-        url_object = self._prepare_url(url, default_scheme="https")
-        if url_object is None:
-            self._youtube_error_message = self._tr("webview_error")  # исправлено: уведомляем о неверном адресе
-            self._youtube_loaded = False
-            self._youtube_page_loaded = False
-            self._youtube_last_url = url or ""
-            if not self._youtube_error_notified and self.isVisible():
-                self.show_notification(self._youtube_error_message, notification_type="error")
-            self._youtube_error_notified = True
-            self.hide_youtube_webview()
-            self.update()
-            return
-
-        url_str = url_object.toString()
-        if url_str != self._youtube_last_url:
-            self._youtube_error_message = ""
-            self._youtube_error_notified = False
-            self._youtube_last_url = url_str
-
-        if self._youtube_error_message and self._youtube_error_notified:
-            # Previous attempt failed and user hasn't changed URL; keep placeholder
-            self.hide_youtube_webview()
-            return
-
-        # If not loaded yet, load now and reset opacity for fade-in
-        if not self._youtube_loaded or self._youtube_error_message:
-            self.youtube_webview.setUrl(url_object)
-            self._youtube_loaded = True
-            self._youtube_page_loaded = False
-            self._youtube_error_message = ""
-            # Reset opacity to 0 for fade-in animation when page loads
-            if hasattr(self.youtube_webview, 'opacity_effect') and self.youtube_webview.opacity_effect:
-                self.youtube_webview.opacity_effect.setOpacity(0.0)
-            self._youtube_error_notified = False
-
-        # If page already loaded, ensure opacity is 1.0
-        if self._youtube_page_loaded:
-            if hasattr(self.youtube_webview, 'opacity_effect') and self.youtube_webview.opacity_effect:
-                self.youtube_webview.opacity_effect.setOpacity(1.0)
-
-        # Position webview at its slide's position
-        youtube_slide_index = self.get_slide_index_for_type(SlideType.YOUTUBE)
-        if youtube_slide_index >= 0:
-            geom = self.get_embedded_card_geometry(youtube_slide_index)
-            self.youtube_webview.setGeometry(geom)
-
-            # Apply rounded corners mask
-            border_radius = int(16 * self.scale_factor)
-            path = QPainterPath()
-            path.addRoundedRect(QRectF(0, 0, geom.width(), geom.height()), border_radius, border_radius)
-            region = QRegion(path.toFillPolygon().toPolygon())
-            self.youtube_webview.setMask(region)
-
-        self.youtube_webview.show()
-        self.youtube_webview.raise_()
-        self.youtube_webview.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
-
-    def show_home_assistant_webview(self, url: str):
-        """Show Home Assistant webview with URL inside the card"""
-        if not self.home_assistant_webview:
-            return
-
-        url_object = self._prepare_url(url, default_scheme="http")
-        if url_object is None:
-            self._home_assistant_error_message = self._tr("webview_error")  # исправлено: сигнализируем о недоступной странице
-            self._home_assistant_loaded = False
-            self._home_assistant_page_loaded = False
-            self._home_assistant_last_url = url or ""
-            if not self._home_assistant_error_notified and self.isVisible():
-                self.show_notification(self._home_assistant_error_message, notification_type="error")
-            self._home_assistant_error_notified = True
-            self.hide_home_assistant_webview()
-            self.update()
-            return
-
-        url_str = url_object.toString()
-        if url_str != self._home_assistant_last_url:
-            self._home_assistant_error_message = ""
-            self._home_assistant_error_notified = False
-            self._home_assistant_last_url = url_str
-
-        if self._home_assistant_error_message and self._home_assistant_error_notified:
-            self.hide_home_assistant_webview()
-            return
-
-        # If not loaded yet, load now and reset opacity for fade-in
-        if not self._home_assistant_loaded or self._home_assistant_error_message:
-            self.home_assistant_webview.setUrl(url_object)
-            self._home_assistant_loaded = True
-            self._home_assistant_page_loaded = False
-            self._home_assistant_error_message = ""
-            # Reset opacity to 0 for fade-in animation when page loads
-            if hasattr(self.home_assistant_webview, 'opacity_effect') and self.home_assistant_webview.opacity_effect:
-                self.home_assistant_webview.opacity_effect.setOpacity(0.0)
-            self._home_assistant_error_notified = False
-
-        # If page already loaded, ensure opacity is 1.0
-        if self._home_assistant_page_loaded:
-            if hasattr(self.home_assistant_webview, 'opacity_effect') and self.home_assistant_webview.opacity_effect:
-                self.home_assistant_webview.opacity_effect.setOpacity(1.0)
-
-        # Position webview at its slide's position
-        ha_slide_index = self.get_slide_index_for_type(SlideType.HOME_ASSISTANT)
-        if ha_slide_index >= 0:
-            geom = self.get_embedded_card_geometry(ha_slide_index)
-            self.home_assistant_webview.setGeometry(geom)
-
-            border_radius = int(16 * self.scale_factor)
-            path = QPainterPath()
-            path.addRoundedRect(QRectF(0, 0, geom.width(), geom.height()), border_radius, border_radius)
-            region = QRegion(path.toFillPolygon().toPolygon())
-            self.home_assistant_webview.setMask(region)
-
-        self.home_assistant_webview.show()
-        self.home_assistant_webview.raise_()
-        self.home_assistant_webview.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+    def hide_all_webviews(self):
+        """Hide all embedded webviews"""
+        self.hide_webview()
+        self._active_webview_for_swipe = None
+        self._active_webview_type = None
+        self._webview_mouse_start = None
+        self._webview_was_transparent = False
 
     def get_slide_index_for_type(self, slide_type: SlideType) -> int:
         """Find the slide index for a given slide type, returns -1 if not found"""
@@ -3349,176 +2651,6 @@ class NDotClockSlider(QWidget):
             if slide['type'] == slide_type:
                 return i
         return -1
-
-    def update_youtube_webview_position(self):
-        """Update YouTube webview position to follow card during animations"""
-        if self.youtube_webview and self.youtube_webview.isVisible():
-            # Find which slide the YouTube webview belongs to
-            youtube_slide_index = self.get_slide_index_for_type(SlideType.YOUTUBE)
-            if youtube_slide_index >= 0:
-                geom = self.get_embedded_card_geometry(youtube_slide_index)
-                self.youtube_webview.setGeometry(geom)
-
-                # Update mask for rounded corners
-                border_radius = int(16 * self.scale_factor)
-                path = QPainterPath()
-                path.addRoundedRect(QRectF(0, 0, geom.width(), geom.height()), border_radius, border_radius)
-                region = QRegion(path.toFillPolygon().toPolygon())
-                self.youtube_webview.setMask(region)
-
-    def update_home_assistant_webview_position(self):
-        """Update Home Assistant webview position to follow card during animations"""
-        if self.home_assistant_webview and self.home_assistant_webview.isVisible():
-            # Find which slide the Home Assistant webview belongs to
-            ha_slide_index = self.get_slide_index_for_type(SlideType.HOME_ASSISTANT)
-            if ha_slide_index >= 0:
-                geom = self.get_embedded_card_geometry(ha_slide_index)
-                self.home_assistant_webview.setGeometry(geom)
-
-                border_radius = int(16 * self.scale_factor)
-                path = QPainterPath()
-                path.addRoundedRect(QRectF(0, 0, geom.width(), geom.height()), border_radius, border_radius)
-                region = QRegion(path.toFillPolygon().toPolygon())
-                self.home_assistant_webview.setMask(region)
-
-    def hide_youtube_webview(self):
-        """Hide YouTube webview"""
-        if self.youtube_webview:
-            self.youtube_webview.hide()
-            self.youtube_webview.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-            self.youtube_webview.setGeometry(-10000, -10000, 1, 1)  # исправлено: убираем webview за пределы экрана
-            self.youtube_webview.setMask(QRegion())  # сбрасываем маску, чтобы не было артефактов
-
-    def hide_home_assistant_webview(self):
-        """Hide Home Assistant webview"""
-        if self.home_assistant_webview:
-            self.home_assistant_webview.hide()
-            self.home_assistant_webview.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-            self.home_assistant_webview.setGeometry(-10000, -10000, 1, 1)  # исправлено: прячем webview при ошибке
-            self.home_assistant_webview.setMask(QRegion())
-
-    def hide_all_webviews(self):
-        """Hide all embedded webviews"""
-        self.hide_youtube_webview()
-        self.hide_home_assistant_webview()
-        self._active_webview_for_swipe = None
-        self._active_webview_type = None
-        self._webview_mouse_start = None
-        self._webview_was_transparent = False
-
-    def on_youtube_load_finished(self, success: bool):
-        """Handle YouTube webview page load completion"""
-        if success:
-            self._youtube_page_loaded = True
-            self._youtube_error_message = ""
-            self._youtube_error_notified = False
-            # Start fade-in animation
-            if self.youtube_webview and self.youtube_webview.isVisible():
-                self.animate_webview_fade_in(self.youtube_webview)
-            # Trigger repaint to hide placeholder
-            self.update()
-        else:
-            self._youtube_error_message = self._tr("webview_error")  # исправлено: запоминаем причину отказа загрузки
-            self._youtube_loaded = False
-            # Hide webview and keep showing placeholder
-            if self.youtube_webview and self.youtube_webview.isVisible():
-                self.hide_youtube_webview()
-            if self.isVisible() and not self._youtube_error_notified:
-                self.show_notification(self._youtube_error_message, notification_type="error")
-            self._youtube_error_notified = True
-            self.update()
-
-    def on_home_assistant_load_finished(self, success: bool):
-        """Handle Home Assistant webview page load completion"""
-        if success:
-            self._home_assistant_page_loaded = True
-            self._home_assistant_error_message = ""
-            self._home_assistant_error_notified = False
-            # Start fade-in animation
-            if self.home_assistant_webview and self.home_assistant_webview.isVisible():
-                self.animate_webview_fade_in(self.home_assistant_webview)
-            # Trigger repaint to hide placeholder
-            self.update()
-        else:
-            self._home_assistant_error_message = self._tr("webview_error")  # исправлено: показываем пользователю ошибку
-            self._home_assistant_loaded = False
-            # Hide webview and keep showing placeholder
-            if self.home_assistant_webview and self.home_assistant_webview.isVisible():
-                self.hide_home_assistant_webview()
-            if self.isVisible() and not self._home_assistant_error_notified:
-                self.show_notification(self._home_assistant_error_message, notification_type="error")
-            self._home_assistant_error_notified = True
-            self.update()
-
-    def _check_youtube_load_timeout(self):
-        """Check if YouTube page load timed out"""
-        if not self._youtube_page_loaded:
-            self._webview_load_timeouts['youtube'] = True
-            self._youtube_error_message = self._tr("webview_error")  # исправлено: отображаем подсказку при тайм-ауте загрузки
-            self._youtube_loaded = False
-            # Don't mark as loaded - keep showing placeholder instead
-            # Hide the webview to prevent graphical glitches
-            if self.youtube_webview and self.youtube_webview.isVisible():
-                self.hide_youtube_webview()
-            if self.isVisible() and not self._youtube_error_notified:
-                self.show_notification(self._youtube_error_message, notification_type="error")
-            self._youtube_error_notified = True
-            self.update()
-
-    def _check_home_assistant_load_timeout(self):
-        """Check if Home Assistant page load timed out"""
-        if not self._home_assistant_page_loaded:
-            self._webview_load_timeouts['home_assistant'] = True
-            self._home_assistant_error_message = self._tr("webview_error")  # исправлено: отображаем подсказку при тайм-ауте загрузки
-            self._home_assistant_loaded = False
-            # Don't mark as loaded - keep showing placeholder instead
-            # Hide the webview to prevent graphical glitches
-            if self.home_assistant_webview and self.home_assistant_webview.isVisible():
-                self.hide_home_assistant_webview()
-            if self.isVisible() and not self._home_assistant_error_notified:
-                self.show_notification(self._home_assistant_error_message, notification_type="error")
-            self._home_assistant_error_notified = True
-            self.update()
-
-    def animate_webview_fade_in(self, webview: QWebEngineView):
-        """Animate webview fade-in from 0 to 1 opacity"""
-        if not hasattr(webview, 'opacity_effect') or webview.opacity_effect is None:
-            return
-
-        # Clean up completed animations first
-        self._webview_fade_animations = [
-            anim for anim in self._webview_fade_animations
-            if anim.state() == QPropertyAnimation.State.Running
-        ]
-
-        # Limit concurrent animations to prevent memory leak
-        while len(self._webview_fade_animations) >= self._max_webview_fade_animations:
-            oldest = self._webview_fade_animations.pop(0)
-            if oldest.state() == QPropertyAnimation.State.Running:
-                oldest.stop()
-            oldest.deleteLater()
-
-        # Create fade-in animation
-        fade_animation = QPropertyAnimation(webview.opacity_effect, b"opacity")
-        fade_animation.setDuration(500)  # 500ms fade-in
-        fade_animation.setStartValue(0.0)
-        fade_animation.setEndValue(1.0)
-        fade_animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
-
-        # Safe removal from list on finish
-        def on_finished():
-            try:
-                if fade_animation in self._webview_fade_animations:
-                    self._webview_fade_animations.remove(fade_animation)
-            except (ValueError, RuntimeError):
-                pass  # Already removed or destroyed
-            fade_animation.deleteLater()
-
-        fade_animation.finished.connect(on_finished)
-        fade_animation.start()
-
-        # Keep reference to prevent garbage collection
-        self._webview_fade_animations.append(fade_animation)
 
     def update_active_webviews(self):
         """Synchronize embedded webviews with slides
@@ -3532,26 +2664,39 @@ class NDotClockSlider(QWidget):
             return
 
         # Find all webview slides and show them at their positions
-        youtube_slide_found = False
-        ha_slide_found = False
-
+        webview_shown = False
         for i, slide in enumerate(self.slides):
-            if slide['type'] == SlideType.YOUTUBE:
-                url = slide['data'].get('url', 'https://www.youtube.com/')
+            if slide['type'] == SlideType.WEBVIEW and i == self.current_slide:
+                url = slide['data'].get('url', '')
                 if url:
-                    self.show_youtube_webview(url)
-                    youtube_slide_found = True
-            elif slide['type'] == SlideType.HOME_ASSISTANT:
-                url = slide['data'].get('url', 'http://homeassistant.local:8123/')
-                if url:
-                    self.show_home_assistant_webview(url)
-                    ha_slide_found = True
+                    self.show_webview(url)
+                    webview_shown = True
+                break
 
-        # Hide webviews that don't have a slide
-        if not youtube_slide_found:
-            self.hide_youtube_webview()
-        if not ha_slide_found:
-            self.hide_home_assistant_webview()
+        # Hide webview if not shown
+        if not webview_shown:
+            self.hide_webview()
+
+    def on_webview_load_finished_callback(self, success: bool):
+        """Callback from WebviewManager when load finishes"""
+        # Don't show webview in edit modes
+        if self.edit_mode or self.card_edit_mode:
+            return
+            
+        if success:
+            # Only update if we're on a webview slide to prevent unnecessary repaints
+            if 0 <= self.current_slide < len(self.slides):
+                slide = self.slides[self.current_slide]
+                if slide['type'] == SlideType.WEBVIEW:
+                    # Page just loaded - show webview at correct position
+                    webview_slide_index = self.get_slide_index_for_type(SlideType.WEBVIEW)
+                    if webview_slide_index >= 0:
+                        geom = self.get_embedded_card_geometry(webview_slide_index)
+                        self.webview_manager.show_webview(geom)
+                    return  # No full update needed
+        # Only call full update on error
+        if not success:
+            self.update()
 
     def animate_to_current_slide(self):
         """Animate to current slide position"""
@@ -3651,6 +2796,40 @@ class NDotClockSlider(QWidget):
     def _on_edit_transition_animation_finished(self):
         self._handle_edit_transition_animation_finished(self.sender())
 
+    def update_webview_geometry(self):
+        """Update geometry of the active webview to match the slide position"""
+        # Don't update geometry in edit modes
+        if self.edit_mode or self.card_edit_mode:
+            return
+            
+        if not self.webview_manager.webview:
+            return
+            
+        # Only update if we're on a webview slide and page is loaded
+        if not self.webview_manager.page_loaded:
+            return
+
+        # Find current webview slide
+        webview_slide_index = self.get_slide_index_for_type(SlideType.WEBVIEW)
+        
+        # Only update if we're currently on the webview slide
+        if webview_slide_index >= 0 and webview_slide_index == self.current_slide:
+             geom = self.get_embedded_card_geometry(webview_slide_index)
+             
+             # Avoid unnecessary updates
+             current_geom = self.webview_manager.webview.geometry()
+             if geom != current_geom:
+                 self.webview_manager.webview.setGeometry(geom)
+                 
+                 # Update mask only if size changed or mask not set
+                 # We check mask() to ensure it's set initially
+                 if geom.size() != current_geom.size() or self.webview_manager.webview.mask().isEmpty():
+                     border_radius = int(16 * self.scale_factor)
+                     path = QPainterPath()
+                     path.addRoundedRect(QRectF(0, 0, geom.width(), geom.height()), border_radius, border_radius)
+                     region = QRegion(path.toFillPolygon().toPolygon())
+                     self.webview_manager.webview.setMask(region)
+
     def on_timeout(self):
         """ARM-optimized timer callback with dynamic interval adjustment
 
@@ -3675,6 +2854,12 @@ class NDotClockSlider(QWidget):
             has_active_animation |= (self.panel_scale_animation.state() == QPropertyAnimation.State.Running)
 
         self._animation_active = has_active_animation
+
+        # Detect if animation just finished
+        prev_animation_active = getattr(self, '_prev_animation_active', False)
+        if prev_animation_active and not has_active_animation:
+            self.update_active_webviews()
+        self._prev_animation_active = has_active_animation
 
         # ARM optimization: Update breathing frame counter using lookup table
         self._breathing_frame = (self._breathing_frame + 1) % 100
@@ -3726,6 +2911,7 @@ class NDotClockSlider(QWidget):
         # Only trigger repaint if something actually changed or breathing animation is visible
         if has_active_animation or time_changed or on_clock_slide or has_digit_animation:
             self.update()
+            self.update_webview_geometry()
         # If no animations, time hasn't changed, and not on clock slide, skip repaint to save CPU
 
     def keyPressEvent(self, event):
@@ -3791,8 +2977,7 @@ class NDotClockSlider(QWidget):
             self._apply_settings_panel_geometry()
 
         # Update webview positions if they exist
-        self.update_youtube_webview_position()
-        self.update_home_assistant_webview_position()
+        self.update_active_webviews()
         self._language_control_layout = None  # исправлено: пересчитываем хит-тесты после изменения размеров
 
         if self.edit_mode:
@@ -3876,14 +3061,10 @@ class NDotClockSlider(QWidget):
                 self.draw_weather_slide(painter, slide)
             elif slide['type'] == SlideType.CUSTOM:
                 self.draw_custom_slide(painter, slide)
-            elif slide['type'] == SlideType.YOUTUBE:
+            elif slide['type'] == SlideType.WEBVIEW:
                 # Draw placeholder if page hasn't loaded yet OR webview is not visible
-                if not self._youtube_page_loaded or not (self.youtube_webview and self.youtube_webview.isVisible() and i == self.current_slide):
-                    self.draw_youtube_slide(painter, slide)
-            elif slide['type'] == SlideType.HOME_ASSISTANT:
-                # Draw placeholder if page hasn't loaded yet OR webview is not visible
-                if not self._home_assistant_page_loaded or not (self.home_assistant_webview and self.home_assistant_webview.isVisible() and i == self.current_slide):
-                    self.draw_home_assistant_slide(painter, slide)
+                if not self.webview_manager.page_loaded or not (self.webview_manager.webview and self.webview_manager.webview.isVisible() and i == self.current_slide):
+                    self.draw_webview_slide(painter, slide)
             elif slide['type'] == SlideType.ADD:
                 self.draw_add_slide(painter)
 
@@ -4020,10 +3201,8 @@ class NDotClockSlider(QWidget):
             self.draw_weather_slide(painter, slide)
         elif slide['type'] == SlideType.CUSTOM:
             self.draw_custom_slide(painter, slide)
-        elif slide['type'] == SlideType.YOUTUBE:
-            self.draw_youtube_slide(painter, slide)
-        elif slide['type'] == SlideType.HOME_ASSISTANT:
-            self.draw_home_assistant_slide(painter, slide)
+        elif slide['type'] == SlideType.WEBVIEW:
+            self.draw_webview_slide(painter, slide)
         elif slide['type'] == SlideType.ADD:
             self.draw_add_slide(painter)
 
@@ -4350,96 +3529,126 @@ class NDotClockSlider(QWidget):
         date_rect = QRect(0, rect_top, canvas_width, canvas_height - rect_top)
         painter.drawText(date_rect, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, date_str)
 
+    def draw_weather_loading(self, painter: QPainter):
+        """Draw loading state for weather slide"""
+        content_height = int(self.height() * 0.7)
+        font_size = max(14, int(content_height * 0.07))
+        font = self._get_cached_font(self.font_family, font_size)
+        
+        color = self._scale_color_by_brightness(QColor(120, 120, 120))
+        painter.setPen(color)
+        painter.setFont(font)
+        
+        painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._tr("loading_weather"))
+
+    def _get_or_create_weather_icon(self, code: int, is_day: int, height: int) -> Optional[QPixmap]:
+        """Get weather icon from cache or create it"""
+        cache_key = (code, is_day, height)
+        
+        if cache_key in self._svg_weather_cache:
+            return self._svg_weather_cache[cache_key]
+
+        # Not in cache, create it
+        icon_name = self.get_weather_icon_name(code, is_day)
+        icon_path = self._get_weather_icon_path(icon_name)
+        
+        if not os.path.exists(icon_path):
+            return None
+            
+        try:
+            svg_renderer = QSvgRenderer(icon_path)
+            if not svg_renderer.isValid():
+                return None
+                
+            svg_size = svg_renderer.defaultSize()
+            aspect_ratio = svg_size.width() / max(1, svg_size.height())
+            icon_width = int(height * aspect_ratio)
+            
+            pixmap = QPixmap(icon_width, height)
+            pixmap.fill(Qt.GlobalColor.transparent)
+            
+            painter = QPainter(pixmap)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            svg_renderer.render(painter, QRectF(0, 0, icon_width, height))
+            painter.end()
+            
+            # LRU Cache management
+            if len(self._svg_weather_cache) >= self._svg_weather_cache_max_size:
+                # Remove a random/old item (Python dicts preserve insertion order, so iter gives oldest)
+                try:
+                    oldest_key = next(iter(self._svg_weather_cache))
+                    del self._svg_weather_cache[oldest_key]
+                except StopIteration:
+                    pass
+            
+            self._svg_weather_cache[cache_key] = pixmap
+            return pixmap
+            
+        except Exception as e:
+            print(f"Error creating weather icon: {e}")
+            return None
+
     def draw_weather_slide(self, painter: QPainter, slide: Optional[dict] = None):
         """Draw weather slide"""
         slide_data_source = (slide or {}).get('data') if isinstance(slide, dict) else None
         slide_data = self._ensure_weather_defaults(slide_data_source)
 
-        # Fix: Ensure dimensions are always positive
-        content_width = max(1, self.width())
-        content_height = max(1, self.height())
-        height_scale = content_height / max(1.0, 480.0)
-
-        if not self.weather_data:
-            loading_font_size = max(14, int(20 * height_scale))
-            loading_color = self._scale_color_by_brightness(QColor(150, 150, 150))
-            painter.setPen(loading_color)
-            painter.setFont(QFont(self.font_family, loading_font_size))
-            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._tr("loading_weather"))
+        if not self.weather_data or self.weather_loading:
+            self.draw_weather_loading(painter)
             return
 
-        # Draw weather icon on top with original aspect ratio
-        code = self.weather_data['code']
+        # Draw weather content
+        content_width = int(self.width() * 0.8)
+        content_height = int(self.height() * 0.7)
+        start_x = (self.width() - content_width) // 2
+        start_y = (self.height() - content_height) // 2
+
+        # Code
+        code = self.weather_data.get('code', 0)
         is_day = self.weather_data.get('is_day', 1)
-        icon_path = self.get_weather_icon_path(code, is_day)
+        
+        current_y = start_y
+        
+        # Get current brightness for icon opacity
+        current_brightness = self.brightness_manager.get_brightness()
+        
+        sections_drawn = False
+        line_gap = int(content_height * 0.05)
 
-        icon_height = max(80, int(content_height * 0.25))
-        current_y = int(content_height * 0.12)
+        if slide_data.get('show_icon', True):
+            icon_height = max(60, int(content_height * 0.4))
+            
+            # Get icon (cached or created)
+            cached_pixmap = self._get_or_create_weather_icon(code, is_day, icon_height)
 
-        if os.path.exists(icon_path) and slide_data.get('show_icon', True):
-            # ARM optimization: Cache rendered SVG weather icons as pixmaps
-            cache_key = (code, is_day, icon_height)
-
-            if cache_key in self._svg_weather_cache:
-                # Use cached pixmap
-                cached_pixmap = self._svg_weather_cache[cache_key]
+            if cached_pixmap:
                 icon_width = cached_pixmap.width()
-                icon_x = int((content_width - icon_width) / 2)
-                # Применяем brightness к иконке через opacity
+                icon_x = start_x + (content_width - icon_width) // 2
+                
+                # Apply brightness to icon via opacity
                 old_opacity = painter.opacity()
-                painter.setOpacity(old_opacity * self._user_brightness)
+                painter.setOpacity(old_opacity * current_brightness)
                 painter.drawPixmap(icon_x, current_y, cached_pixmap)
                 painter.setOpacity(old_opacity)
-            else:
-                # Render SVG to pixmap and cache it
-                svg_renderer = QSvgRenderer(icon_path)
-                if svg_renderer.isValid():
-                    # Get original SVG aspect ratio
-                    svg_size = svg_renderer.defaultSize()
-                    aspect_ratio = svg_size.width() / max(1, svg_size.height())
-
-                    # Calculate icon dimensions maintaining aspect ratio
-                    icon_width = int(icon_height * aspect_ratio)
-
-                    # Render to pixmap
-                    pixmap = QPixmap(icon_width, icon_height)
-                    pixmap.fill(Qt.GlobalColor.transparent)
-                    pix_painter = QPainter(pixmap)
-                    pix_painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-                    svg_renderer.render(pix_painter, QRectF(0, 0, icon_width, icon_height))
-                    pix_painter.end()
-
-                    # LRU cache management
-                    if len(self._svg_weather_cache) >= self._svg_weather_cache_max_size:
-                        first_key = next(iter(self._svg_weather_cache))
-                        del self._svg_weather_cache[first_key]
-
-                    # Cache the pixmap
-                    self._svg_weather_cache[cache_key] = pixmap
-
-                    # Draw cached pixmap с brightness
-                    icon_x = int((content_width - icon_width) / 2)
-                    old_opacity = painter.opacity()
-                    painter.setOpacity(old_opacity * self._user_brightness)
-                    painter.drawPixmap(icon_x, current_y, pixmap)
-                    painter.setOpacity(old_opacity)
-
-            current_y += icon_height + max(12, int(content_height * 0.06))
-
-        line_gap = max(10, int(content_height * 0.05))
-        sections_drawn = False
+            
+            current_y += icon_height + line_gap
+            sections_drawn = True
 
         if slide_data.get('show_temp', True):
-            temp = self.weather_data['temp']
-            temp_color = self._scale_color_by_brightness(self.get_temperature_color(temp))
-            temp_font_size = max(28, int(content_height * 0.18))
+            temp = self.weather_data.get('temp', 0)
+            temp_font_size = max(24, int(content_height * 0.25))
             temp_font = self._get_cached_font(self.font_family, temp_font_size)
+            temp_color = self.get_temperature_color(temp)
+            temp_color = self._scale_color_by_brightness(temp_color)
+            
             painter.setPen(temp_color)
             painter.setFont(temp_font)
+            
             temp_metrics = self._get_cached_fontmetrics(self.font_family, temp_font_size)
             temp_height = temp_metrics.height()
-            temp_rect = QRect(0, current_y, content_width, content_height - current_y)
-            painter.drawText(temp_rect, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, f"{temp}°C")
+            temp_rect = QRect(start_x, current_y, content_width, temp_height)
+            painter.drawText(temp_rect, Qt.AlignmentFlag.AlignCenter, f"{temp}°C")
+            
             current_y += temp_height + line_gap
             sections_drawn = True
 
@@ -4452,13 +3661,13 @@ class NDotClockSlider(QWidget):
             painter.setFont(desc_font)
             desc_metrics = self._get_cached_fontmetrics(self.font_family, desc_font_size)
             desc_height = desc_metrics.height()
-            desc_rect = QRect(0, current_y, content_width, content_height - current_y)
-            painter.drawText(desc_rect, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, desc)
+            desc_rect = QRect(start_x, current_y, content_width, desc_height)
+            painter.drawText(desc_rect, Qt.AlignmentFlag.AlignCenter, desc)
             current_y += desc_height + line_gap
             sections_drawn = True
 
         if slide_data.get('show_wind', True):
-            wind_speed = self.weather_data['wind']
+            wind_speed = self.weather_data.get('wind', 0)
             wind_text = self._tr("weather_wind", speed=wind_speed)
             wind_font_size = max(11, int(content_height * 0.05))
             wind_font = self._get_cached_font(self.font_family, wind_font_size)
@@ -4467,8 +3676,8 @@ class NDotClockSlider(QWidget):
             painter.setFont(wind_font)
             wind_metrics = self._get_cached_fontmetrics(self.font_family, wind_font_size)
             wind_height = wind_metrics.height()
-            wind_rect = QRect(0, current_y, content_width, content_height - current_y)
-            painter.drawText(wind_rect, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, wind_text)
+            wind_rect = QRect(start_x, current_y, content_width, wind_height)
+            painter.drawText(wind_rect, Qt.AlignmentFlag.AlignCenter, wind_text)
             current_y += wind_height + line_gap
             sections_drawn = True
 
@@ -4563,32 +3772,31 @@ class NDotClockSlider(QWidget):
                 except Exception:
                     pass
 
-    def get_weather_icon_path(self, code: int, is_day: int) -> str:
-        """Get SVG icon path for weather code"""
-        resources_dir = self.get_resource_dir("resources")
-
-        # Map weather codes to icon filenames
+    def get_weather_icon_name(self, code: int, is_day: int) -> str:
+        """Get icon filename for weather code"""
         if code in [0, 1]:  # Clear / Mainly clear
-            icon_name = "clear day.svg" if is_day else "clear night.svg"
+            return "clear day.svg" if is_day else "clear night.svg"
         elif code == 2:  # Partly cloudy
-            icon_name = "partly cloudy day.svg" if is_day else "partly cloudy night.svg"
+            return "partly cloudy day.svg" if is_day else "partly cloudy night.svg"
         elif code in [3, 45, 48]:  # Overcast / Fog / Rime fog
-            icon_name = "cloudy day.svg"
+            return "cloudy day.svg"
         elif code in [51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82]:  # Rain / Drizzle / Showers
-            icon_name = "showers day.svg"
+            return "showers day.svg"
         elif code in [71, 73, 75, 77, 85, 86]:  # Snow / Snow grains / Snow showers
-            icon_name = "cloudy day.svg"  # Use cloudy icon for snow
+            return "cloudy day.svg"  # Use cloudy icon for snow
         elif code in [95, 96, 99]:  # Thunderstorm / Hail
-            icon_name = "showers day.svg"
+            return "showers day.svg"
         else:
-            icon_name = "no data.svg"
+            return "no data.svg"
 
+    def _get_weather_icon_path(self, icon_name: str) -> str:
+        """Get absolute path for weather icon"""
+        resources_dir = self.get_resource_dir("resources")
         icon_path = os.path.join(resources_dir, icon_name)
-
-        # Fallback to "no data.svg" if file doesn't exist
+        
         if not os.path.exists(icon_path):
             icon_path = os.path.join(resources_dir, "no data.svg")
-
+            
         return icon_path
 
     def draw_custom_slide(self, painter: QPainter, slide: dict):
@@ -4603,20 +3811,32 @@ class NDotClockSlider(QWidget):
         text_rect = QRect(margin, margin, self.width() - 2 * margin, self.height() - 2 * margin)
         painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, text)
 
-    def draw_youtube_slide(self, painter: QPainter, slide: dict):
-        """Draw YouTube slide"""
+    def draw_webview_slide(self, painter: QPainter, slide: dict):
+        """Draw universal webview slide"""
         data = slide.get('data', {})
-        title = data.get('title', self._tr('youtube_default_title'))
+        title = data.get('title', self._tr('webview_default_title'))
+        url = data.get('url', '')
 
-        # Draw YouTube logo
-        painter.setPen(QColor(255, 0, 0))
+        # Determine icon and color based on URL
+        icon = "🌐"
+        icon_color = QColor(100, 150, 255)
+        
+        if 'youtube.com' in url or 'youtu.be' in url:
+            icon = "▶"
+            icon_color = QColor(255, 0, 0)
+        elif 'homeassistant' in url or ':8123' in url:
+            icon = "🏠"
+            icon_color = QColor(0, 153, 255)
+
+        # Draw icon
+        painter.setPen(icon_color)
         icon_size = max(50, int(80 * self.scale_factor))
         icon_font_size = max(30, int(50 * self.scale_factor))
         painter.setFont(QFont(self.font_family, icon_font_size, QFont.Weight.Bold))
 
         icon_y = int(self.height() * 0.4)
         icon_rect = QRect(0, icon_y - icon_size // 2, self.width(), icon_size)
-        painter.drawText(icon_rect, Qt.AlignmentFlag.AlignCenter, "▶")
+        painter.drawText(icon_rect, Qt.AlignmentFlag.AlignCenter, icon)
 
         # Draw title below
         painter.setPen(QColor(240, 240, 240))
@@ -4628,7 +3848,8 @@ class NDotClockSlider(QWidget):
         title_rect = QRect(margin, title_y, self.width() - 2 * margin, int(self.height() * 0.2))
         painter.drawText(title_rect, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap, title)
 
-        if self._youtube_error_message:
+        # Show error message if any
+        if self.webview_manager.error_message:
             painter.setPen(QColor(255, 110, 110))
             error_font = QFont(self.font_family, max(12, int(16 * self.scale_factor)))
             painter.setFont(error_font)
@@ -4636,76 +3857,8 @@ class NDotClockSlider(QWidget):
                                self.width() - 2 * margin, int(self.height() * 0.18))
             painter.drawText(error_rect,
                              Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap,
-                             self._youtube_error_message)
+                             self.webview_manager.error_message)
 
-    def draw_home_assistant_slide(self, painter: QPainter, slide: dict):
-        """Draw Home Assistant slide"""
-        data = slide.get('data', {})
-        title = data.get('title', self._tr('ha_default_title'))
-        url = data.get('url', 'http://homeassistant.local:8123/')
-
-        painter.save()
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-
-        icon_size = max(70, int(110 * self.scale_factor))
-        center_x = self.width() // 2
-        icon_center_y = int(self.height() * 0.38)
-
-        circle_rect = QRectF(center_x - icon_size / 2, icon_center_y - icon_size / 2, icon_size, icon_size)
-        painter.setPen(Qt.PenStyle.NoPen)
-        circle_color = self._scale_color_by_brightness(QColor(0, 153, 255, 220))
-        painter.setBrush(circle_color)
-        painter.drawEllipse(circle_rect)
-
-        house_width = icon_size * 0.6
-        house_height = icon_size * 0.5
-        roof_height = icon_size * 0.35
-        base_left = center_x - house_width / 2
-        base_top = icon_center_y - house_height / 2 + roof_height * 0.2
-
-        path = QPainterPath()
-        path.moveTo(center_x, icon_center_y - roof_height)
-        path.lineTo(base_left - house_width * 0.05, base_top)
-        path.lineTo(base_left - house_width * 0.05, base_top + house_height)
-        path.lineTo(center_x + house_width * 0.55, base_top + house_height)
-        path.lineTo(center_x + house_width * 0.55, base_top)
-        path.closeSubpath()
-        house_color = self._scale_color_by_brightness(QColor(255, 255, 255))
-        painter.setBrush(house_color)
-        painter.drawPath(path)
-
-        door_width = house_width * 0.22
-        door_height = house_height * 0.5
-        door_rect = QRectF(center_x - door_width / 2, base_top + house_height - door_height, door_width, door_height)
-        painter.drawRoundedRect(door_rect, door_width * 0.25, door_width * 0.25)
-
-        window_radius = max(4, icon_size * 0.06)
-        window_offset = house_width * 0.2
-        window_color = self._scale_color_by_brightness(QColor(0, 153, 255, 220))
-        painter.setBrush(window_color)
-        painter.drawEllipse(QPointF(center_x - window_offset, base_top + house_height * 0.45), window_radius, window_radius)
-        painter.drawEllipse(QPointF(center_x + window_offset, base_top + house_height * 0.45), window_radius, window_radius)
-
-        title_font_size = max(16, int(24 * self.scale_factor))
-        title_color = self._scale_color_by_brightness(QColor(240, 240, 240))
-        painter.setPen(title_color)
-        painter.setFont(QFont(self.font_family, title_font_size, QFont.Weight.Bold))
-        margin = int(30 * self.scale_factor)
-        title_top = int(self.height() * 0.58)
-        title_rect = QRect(margin, title_top, self.width() - 2 * margin, int(self.height() * 0.18))
-        painter.drawText(title_rect, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap, title)
-
-        if self._home_assistant_error_message:
-            painter.setPen(QColor(255, 110, 110))
-            error_font = QFont(self.font_family, max(12, int(16 * self.scale_factor)))
-            painter.setFont(error_font)
-            error_rect = QRect(margin, title_rect.bottom() + self.get_spacing(8, 6),
-                               self.width() - 2 * margin, int(self.height() * 0.18))
-            painter.drawText(error_rect,
-                             Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap,
-                             self._home_assistant_error_message)
-
-        painter.restore()
 
     def draw_add_slide(self, painter: QPainter):
         """Draw add button slide"""
@@ -4820,48 +3973,6 @@ class NDotClockSlider(QWidget):
         hint_rect = QRect(0, hint_top, self.width(), self.height() - hint_top)
         painter.drawText(hint_rect, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, hint_text)
 
-        # Navigation arrows removed from edit mode - use swipe gestures or arrow keys instead
-        # if len(self.slides) > 1:
-        #     arrow_y = self.height() // 2
-        #     arrow_size = int(20 * self.scale_factor)
-        #     pen_width = max(2, int(3 * self.scale_factor))
-        #
-        #     # Left arrow
-        #     if self.current_slide > 0:
-        #         painter.setPen(QPen(QColor(200, 200, 200), pen_width))
-        #         painter.setBrush(Qt.BrushStyle.NoBrush)
-        #         left_arrow_x = int(30 * self.scale_factor)
-        #         # Draw left arrow triangle
-        #         points = [
-        #             QPoint(left_arrow_x + arrow_size, arrow_y - arrow_size),
-        #             QPoint(left_arrow_x, arrow_y),
-        #             QPoint(left_arrow_x + arrow_size, arrow_y + arrow_size)
-        #         ]
-        #         painter.drawPolyline(points)
-        #
-        #         # Card counter on left
-        #         counter_font_size = max(10, int(12 * self.scale_factor))
-        #         painter.setFont(QFont(self.font_family, counter_font_size))
-        #         counter_text = f"{self.current_slide + 1}/{len(self.slides)}"
-        #         counter_offset = int(40 * self.scale_factor)
-        #         counter_width = int(60 * self.scale_factor)
-        #         counter_height = int(20 * self.scale_factor)
-        #         painter.drawText(left_arrow_x - 10, arrow_y + counter_offset, counter_width, counter_height,
-        #                        Qt.AlignmentFlag.AlignCenter, counter_text)
-        #
-        #     # Right arrow
-        #     if self.current_slide < len(self.slides) - 1:
-        #         painter.setPen(QPen(QColor(200, 200, 200), pen_width))
-        #         painter.setBrush(Qt.BrushStyle.NoBrush)
-        #         right_arrow_x = self.width() - int(30 * self.scale_factor)
-        #         # Draw right arrow triangle
-        #         points = [
-        #             QPoint(right_arrow_x - arrow_size, arrow_y - arrow_size),
-        #             QPoint(right_arrow_x, arrow_y),
-        #             QPoint(right_arrow_x - arrow_size, arrow_y + arrow_size)
-        #         ]
-        #         painter.drawPolyline(points)
-
         # Navigation dots indicator
         self.draw_edit_mode_dots(painter)
         
@@ -4941,372 +4052,38 @@ class NDotClockSlider(QWidget):
     def save_settings(self):
         """Save settings to file"""
         settings = {
-            'user_brightness': self._manual_brightness,
-            'digit_color': (self.digit_color.red(), self.digit_color.green(), self.digit_color.blue()),
-            'background_color': (self.background_color.red(), self.background_color.green(),
-                               self.background_color.blue()),
-            'colon_color': (self.colon_color.red(), self.colon_color.green(), self.colon_color.blue()),
+            'user_brightness': self.brightness_manager.manual_brightness,
+            'digit_color': self.digit_color,
+            'background_color': self.background_color,
+            'colon_color': self.colon_color,
             'language': self.current_language,
-            'slides': [{'type': s['type'].value, 'data': s['data']} for s in self.slides],
+            'slides': self.slides,
             'location': {'lat': self.location_lat, 'lon': self.location_lon},
             'fullscreen': self.is_fullscreen,
-            'auto_brightness_enabled': self._auto_brightness_enabled,
-            'auto_brightness_camera': self._auto_brightness_camera_index,
-            'auto_brightness_interval_ms': self._auto_brightness_interval_ms,
-            'auto_brightness_min': self._auto_brightness_min,
-            'auto_brightness_max': self._auto_brightness_max,
+            'auto_brightness_enabled': self.brightness_manager.is_auto_enabled(),
+            'auto_brightness_camera': self.brightness_manager._auto_brightness_camera_index,
+            'auto_brightness_interval_ms': self.brightness_manager._auto_brightness_interval_ms,
+            'auto_brightness_min': self.brightness_manager._auto_brightness_min,
+            'auto_brightness_max': self.brightness_manager._auto_brightness_max,
         }
-        
-        try:
-            with open(self.settings_file, 'w', encoding='utf-8') as f:
-                json.dump(settings, f, indent=4, ensure_ascii=False)
-        except Exception:
-            pass
-
-    def load_settings(self):
-        """Load settings from file"""
-        try:
-            if os.path.exists(self.settings_file):
-                with open(self.settings_file, 'r', encoding='utf-8') as f:
-                    settings = json.load(f)
-
-                self._manual_brightness = float(settings.get('user_brightness', 0.8))
-                self._manual_brightness = max(0.0, min(1.0, self._manual_brightness))
-                auto_enabled = bool(settings.get('auto_brightness_enabled', False))
-                self._auto_brightness_camera_index = int(settings.get('auto_brightness_camera', 0))
-                self._auto_brightness_interval_ms = int(settings.get(
-                    'auto_brightness_interval_ms',
-                    self.default_settings['auto_brightness_interval_ms']
-                ))
-                self._auto_brightness_interval_ms = max(250, self._auto_brightness_interval_ms)
-
-                auto_min = float(settings.get('auto_brightness_min', self.default_settings['auto_brightness_min']))
-                auto_max = float(settings.get('auto_brightness_max', self.default_settings['auto_brightness_max']))
-                if auto_min > auto_max:
-                    auto_min, auto_max = auto_max, auto_min
-                self._auto_brightness_min = max(0.0, min(1.0, auto_min))
-                self._auto_brightness_max = max(self._auto_brightness_min, min(1.0, auto_max))
-
-                # Apply manual brightness first to ensure caches are correct
-                self._auto_brightness_enabled = False
-                self.user_brightness = self._manual_brightness
-                self._auto_brightness_enabled = auto_enabled
-                self._pending_auto_brightness_activation = auto_enabled
-
-                digit_color = settings.get('digit_color', (246, 246, 255))
-                self.digit_color = QColor(*digit_color)
-                
-                bg_color = settings.get('background_color', (0, 0, 0))
-                self.background_color = QColor(*bg_color)
-                
-                colon_color = settings.get('colon_color', (220, 40, 40))
-                self.colon_color = QColor(*colon_color)
-                
-                self.current_language = settings.get('language', 'RU')
-
-                # Load location
-                location = settings.get('location', {'lat': None, 'lon': None})
-                self.location_lat = location.get('lat')
-                self.location_lon = location.get('lon')
-
-                slides_data = settings.get('slides', [])
-                self.slides = []
-                for s in slides_data:
-                    self.slides.append({
-                        'type': SlideType(s['type']),
-                        'data': s.get('data', {})
-                    })
-
-                # Load fullscreen state
-                self.is_fullscreen = settings.get('fullscreen', False)
-            else:
-                self._manual_brightness = 0.8
-                self.user_brightness = self._manual_brightness
-                self.digit_color = QColor(246, 246, 255)
-                self.background_color = QColor(0, 0, 0)
-                self.colon_color = QColor(220, 40, 40)
-                self.current_language = 'RU'
-                self.slides = []
-                self.is_fullscreen = False
-                self._auto_brightness_enabled = False
-                self._auto_brightness_min = self.default_settings['auto_brightness_min']
-                self._auto_brightness_max = self.default_settings['auto_brightness_max']
-                self._auto_brightness_interval_ms = self.default_settings['auto_brightness_interval_ms']
-                self._auto_brightness_camera_index = self.default_settings['auto_brightness_camera']
-                self._pending_auto_brightness_activation = False
-        except Exception:
-            self.user_brightness = 0.8
-            self._manual_brightness = 0.8
-            self.digit_color = QColor(246, 246, 255)
-            self.background_color = QColor(0, 0, 0)
-            self.colon_color = QColor(220, 40, 40)
-            self.current_language = 'RU'
-            self.slides = []
-            self.is_fullscreen = False
-            self._auto_brightness_enabled = False
-            self._auto_brightness_min = self.default_settings['auto_brightness_min']
-            self._auto_brightness_max = self.default_settings['auto_brightness_max']
-            self._auto_brightness_interval_ms = self.default_settings['auto_brightness_interval_ms']
-            self._auto_brightness_camera_index = self.default_settings['auto_brightness_camera']
-            self._pending_auto_brightness_activation = False
-
-        self._apply_auto_brightness_env_overrides()
-
-    def _apply_auto_brightness_env_overrides(self) -> None:
-        """Apply runtime overrides from environment variables."""
-        if (
-            self._auto_brightness_interval_override is None
-            and int(self._auto_brightness_interval_ms) == 2500
-        ):
-            self._auto_brightness_interval_ms = self.default_settings['auto_brightness_interval_ms']
-        if self._auto_brightness_interval_override is not None:
-            self._auto_brightness_interval_ms = self._auto_brightness_interval_override
-        self._auto_brightness_interval_ms = max(150, int(self._auto_brightness_interval_ms))
-
-        if (
-            self._auto_brightness_min_override is None
-            and math.isclose(self._auto_brightness_min, 0.25, abs_tol=1e-3)
-        ):
-            self._auto_brightness_min = self.default_settings['auto_brightness_min']
-        if self._auto_brightness_min_override is not None:
-            self._auto_brightness_min = self._auto_brightness_min_override
-        if self._auto_brightness_max_override is not None:
-            self._auto_brightness_max = max(self._auto_brightness_min, self._auto_brightness_max_override)
-
-        if self._auto_brightness_verbose:
-            print(
-                "[AutoBrightness] Effective settings: "
-                f"interval={self._auto_brightness_interval_ms}ms, "
-                f"range=({self._auto_brightness_min:.3f}..{self._auto_brightness_max:.3f}), "
-                f"smoothing={self._auto_brightness_smoothing:.3f}, "
-                f"calibration_decay={self._ambient_calibration_decay:.4f}",
-                file=sys.stderr,
-                flush=True,
-            )
-
-    def _sync_brightness_slider(self):
-        """Update slider position without triggering signals."""
-        if self.brightness_slider is not None:
-            self.brightness_slider.blockSignals(True)
-            self.brightness_slider.setValue(int(self._manual_brightness * 100))
-            self.brightness_slider.blockSignals(False)
-
-    def _apply_system_backlight(self, value: float):
-        """Best-effort attempt to sync hardware backlight with requested brightness."""
-        if not self._system_backlight:
-            if self._system_backlight_verbose:
-                print(f"[Backlight] No system backlight controller available", file=sys.stderr, flush=True)
-            return
-        try:
-            raw_value = int(round(value * self._system_backlight.max_brightness))
-            if self._system_backlight_verbose:
-                if (
-                    self._system_backlight_last_logged_raw is None
-                    or abs(self._system_backlight_last_logged_raw - raw_value) >= 2
-                ):
-                    print(
-                        f"[Backlight] Setting brightness to {value:.3f} ({raw_value}/{self._system_backlight.max_brightness})",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-            self._system_backlight_last_logged_raw = raw_value
-            self._system_backlight.set_level(value)
-        except PermissionError as exc:
-            if not self._system_backlight_error_notified:
-                self._system_backlight_error_notified = True
-                self.show_notification(
-                    self._tr("system_backlight_error_permission"),
-                    duration=5000,
-                    notification_type="warning",
-                )
-            if self._system_backlight_verbose:
-                print(f"[Backlight] Permission denied: {exc}", file=sys.stderr, flush=True)
-        except Exception as exc:
-            if self._system_backlight_verbose:
-                print(f"[Backlight] Disabling system backlight due to error: {exc}", file=sys.stderr, flush=True)
-            self._system_backlight = None
-            if not self._system_backlight_error_notified:
-                self._system_backlight_error_notified = True
-                self.show_notification(
-                    self._tr("system_backlight_error_generic", error=str(exc)),
-                    duration=5000,
-                    notification_type="warning",
-                )
+        self.settings_manager.save_settings(settings)
 
     def _scale_color_by_brightness(self, color: QColor) -> QColor:
         """Масштабирует цвет по текущей яркости"""
         scaled = QColor(color)
-        scaled.setRed(int(scaled.red() * self._user_brightness))
-        scaled.setGreen(int(scaled.green() * self._user_brightness))
-        scaled.setBlue(int(scaled.blue() * self._user_brightness))
+        brightness = self.brightness_manager.get_brightness()
+        scaled.setRed(int(scaled.red() * brightness))
+        scaled.setGreen(int(scaled.green() * brightness))
+        scaled.setBlue(int(scaled.blue() * brightness))
         return scaled
-
-    def _apply_brightness_to_webviews(self, brightness: float):
-        """Применяет затемнение к webview виджетам через CSS filter"""
-        # Создаем CSS фильтр для brightness
-        # brightness(1.0) = нормальная яркость, brightness(0.5) = 50% яркость
-        filter_css = f"filter: brightness({brightness:.3f});"
-
-        # Применяем к YouTube webview
-        if hasattr(self, 'youtube_webview') and self.youtube_webview:
-            try:
-                page = self.youtube_webview.page()
-                if page:
-                    # Применяем CSS фильтр к body
-                    js_code = f"""
-                    (function() {{
-                        let style = document.getElementById('ndot-brightness-filter');
-                        if (!style) {{
-                            style = document.createElement('style');
-                            style.id = 'ndot-brightness-filter';
-                            document.head.appendChild(style);
-                        }}
-                        style.textContent = 'html, body {{ {filter_css} }}';
-                    }})();
-                    """
-                    page.runJavaScript(js_code)
-            except Exception:
-                pass
-
-        # Применяем к Home Assistant webview
-        if hasattr(self, 'home_assistant_webview') and self.home_assistant_webview:
-            try:
-                page = self.home_assistant_webview.page()
-                if page:
-                    js_code = f"""
-                    (function() {{
-                        let style = document.getElementById('ndot-brightness-filter');
-                        if (!style) {{
-                            style = document.createElement('style');
-                            style.id = 'ndot-brightness-filter';
-                            document.head.appendChild(style);
-                        }}
-                        style.textContent = 'html, body {{ {filter_css} }}';
-                    }})();
-                    """
-                    page.runJavaScript(js_code)
-            except Exception:
-                pass
-
-    def _apply_brightness_direct(self, value: float):
-        """Прямое применение яркости без анимации (используется внутри анимации)"""
-        clamped = max(0.0, min(1.0, float(value)))
-
-        # Если доступна системная подсветка - используем только её
-        if self._system_backlight:
-            if self._system_backlight_verbose:
-                if (
-                    self._system_backlight_last_ui_log is None
-                    or abs(self._system_backlight_last_ui_log - clamped) >= 0.02
-                ):
-                    print(
-                        f"[Backlight] Hardware backlight mode: UI=1.0, Display={clamped:.3f}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    self._system_backlight_last_ui_log = clamped
-            # Устанавливаем UI яркость на максимум (контент остается ярким)
-            if not math.isclose(self._user_brightness, 1.0, rel_tol=1e-3):
-                if self._system_backlight_verbose:
-                    print(f"[Backlight] Setting UI brightness to 1.0 (was {self._user_brightness:.3f})", file=sys.stderr, flush=True)
-                self._user_brightness = 1.0
-                self._update_cached_colors()
-                self.update()
-            # Сохраняем текущее значение яркости дисплея
-            self._current_display_brightness = clamped
-            # Управляем только системной подсветкой
-            self._apply_system_backlight(clamped)
-            # Webview остаются на полной яркости
-            self._apply_brightness_to_webviews(1.0)
-            return
-
-        # Режим software brightness: используем color scaling
-        # Затемняем painted content через масштабирование цветов
-        if not math.isclose(clamped, self._user_brightness, rel_tol=1e-3):
-            self._user_brightness = clamped
-            self._update_cached_colors()
-            self.update()
-
-        # Применяем затемнение к webview виджетам
-        self._apply_brightness_to_webviews(clamped)
-    
-    def _apply_brightness(self, value: float, *, from_auto: bool):
-        """Apply brightness value with Bezier curve animation for auto-brightness."""
-        clamped = max(0.0, min(1.0, float(value)))
-        if not from_auto:
-            self._manual_brightness = clamped
-        
-        if self._system_backlight_verbose:
-            should_log = True
-            if from_auto:
-                if self._backlight_last_apply_log is not None and abs(self._backlight_last_apply_log - clamped) < 0.015:
-                    should_log = False
-            if should_log:
-                mode = "AUTO" if from_auto else "MANUAL"
-                print(
-                    f"[Backlight] _apply_brightness({clamped:.3f}, from_auto={from_auto}) mode={mode}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                if from_auto:
-                    self._backlight_last_apply_log = clamped
-        
-        # Для ручного управления - без анимации
-        if not from_auto:
-            if self._system_backlight_verbose:
-                print(f"[Backlight] Manual mode: applying directly", file=sys.stderr, flush=True)
-            self._apply_brightness_direct(clamped)
-            self._sync_brightness_slider()
-            self._backlight_last_apply_log = None
-            return
-
-        if self._system_backlight:
-            # При управлении аппаратной подсветкой нет смысла запускать UI-анимацию
-            self._apply_brightness_direct(clamped)
-            return
-
-        # Для автояркости с software brightness - с анимацией по кривой Безье
-        if not self._brightness_animation:
-            # Fallback на прямое применение, если анимация не инициализирована
-            if self._system_backlight_verbose:
-                print(f"[Backlight] No animation object, applying directly", file=sys.stderr, flush=True)
-            self._apply_brightness_direct(clamped)
-            return
-
-        # Вычисляем разницу для адаптивной длительности анимации
-        # В software brightness режиме используем _user_brightness
-        current_brightness = getattr(self, "_user_brightness", clamped)
-        
-        diff = abs(clamped - current_brightness)
-        
-        # Адаптивная длительность: быстрее для больших изменений
-        if diff > 0.2:
-            duration = 450  # Быстрее для больших изменений
-        elif diff > 0.1:
-            duration = 600  # Средне
-        else:
-            duration = 750  # Плавно для малых изменений
-        
-        if self._system_backlight_verbose:
-            print(f"[Backlight] Starting animation: {current_brightness:.3f} -> {clamped:.3f} (diff={diff:.3f}, duration={duration}ms)", file=sys.stderr, flush=True)
-        
-        # Останавливаем текущую анимацию если она идёт
-        if self._brightness_animation.state() == QPropertyAnimation.State.Running:
-            self._brightness_animation.stop()
-        
-        # Настраиваем и запускаем анимацию
-        self._brightness_animation.setDuration(duration)
-        self._brightness_animation.setStartValue(current_brightness)
-        self._brightness_animation.setEndValue(clamped)
-        self._brightness_animation.start()
 
     @property
     def user_brightness(self) -> float:
-        return self._user_brightness
+        return self.brightness_manager.manual_brightness
 
     @user_brightness.setter
     def user_brightness(self, value: float):
-        self._apply_brightness(value, from_auto=False)
+        self.brightness_manager.set_manual_brightness(value)
 
     @property
     def digit_color(self) -> QColor:
@@ -5343,320 +4120,32 @@ class NDotClockSlider(QWidget):
             self._update_cached_colors()
             self.update()
 
-    def _enable_auto_brightness_from_settings(self):
-        """Start auto-brightness after configuration load without persisting immediately."""
-        self._suppress_auto_brightness_save = True
-        try:
-            self.set_auto_brightness_enabled(True, user_triggered=False)
-        finally:
-            self._suppress_auto_brightness_save = False
+    def _set_auto_brightness_controls_state(self):
+        """Initialize auto-brightness controls state from saved settings."""
+        if self.auto_brightness_checkbox:
+            is_enabled = self.brightness_manager.is_auto_enabled()
+            self.auto_brightness_checkbox.blockSignals(True)
+            self.auto_brightness_checkbox.setChecked(is_enabled)
+            self.auto_brightness_checkbox.blockSignals(False)
+        
+        if self.brightness_slider:
+            self.brightness_slider.setEnabled(not self.brightness_manager.is_auto_enabled())
 
     def _handle_auto_brightness_checkbox(self, state):
         """Callback for auto-brightness checkbox state changes."""
-        # PyQt6 может передать как int, так и enum
         if isinstance(state, int):
-            enabled = (state == 2)  # Qt.CheckState.Checked = 2
+            enabled = (state == 2)
         else:
             enabled = (state == Qt.CheckState.Checked)
-        if enabled == self._auto_brightness_enabled:
-            return
-        self.set_auto_brightness_enabled(enabled, user_triggered=True)
-
-    def _set_auto_brightness_controls_state(self):
-        """Enable/disable manual controls to reflect auto-brightness state."""
-        if self.auto_brightness_checkbox is not None:
-            self.auto_brightness_checkbox.blockSignals(True)
-            self.auto_brightness_checkbox.setChecked(self._auto_brightness_enabled)
-            self.auto_brightness_checkbox.blockSignals(False)
-        if self.brightness_slider is not None:
-            self.brightness_slider.setEnabled(not self._auto_brightness_enabled)
-            if not self._auto_brightness_enabled:
-                self._sync_brightness_slider()
+        self.brightness_manager.set_auto_brightness_enabled(enabled, user_triggered=True)
+        # Save settings to persist auto-brightness state
+        self.save_settings()
 
     def _on_brightness_slider_changed(self, value: int):
         """Manual slider handler."""
-        if self._auto_brightness_enabled:
-            self._sync_brightness_slider()
+        if self.brightness_manager.is_auto_enabled():
             return
-        self._apply_brightness(value / 100.0, from_auto=False)
-
-    def _map_ambient_to_user_brightness(self, ambient: float) -> float:
-        """Map ambient 0..1 value to user brightness range."""
-        ambient = max(0.0, min(1.0, ambient))
-        if self._ambient_dynamic_min is None or self._ambient_dynamic_max is None:
-            baseline_min = max(0.0, ambient - 0.05)
-            baseline_max = min(1.0, ambient + 0.10)
-            self._ambient_dynamic_min = baseline_min
-            self._ambient_dynamic_max = baseline_max
-            if self._auto_brightness_verbose:
-                print(
-                    f"[AutoBrightness] Calibration initialized: min={self._ambient_dynamic_min:.3f}, max={self._ambient_dynamic_max:.3f}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-        else:
-            if ambient < self._ambient_dynamic_min:
-                self._ambient_dynamic_min = ambient
-            else:
-                self._ambient_dynamic_min += (ambient - self._ambient_dynamic_min) * self._ambient_calibration_decay
-
-            if ambient > self._ambient_dynamic_max:
-                self._ambient_dynamic_max = ambient
-            else:
-                self._ambient_dynamic_max += (ambient - self._ambient_dynamic_max) * self._ambient_calibration_decay
-
-        if self._ambient_dynamic_min is None or self._ambient_dynamic_max is None:
-            dynamic_min = 0.0
-            dynamic_max = 1.0
-        else:
-            if self._ambient_dynamic_max - self._ambient_dynamic_min < 0.05:
-                midpoint = (self._ambient_dynamic_min + self._ambient_dynamic_max) / 2.0
-                self._ambient_dynamic_min = max(0.0, midpoint - 0.025)
-                self._ambient_dynamic_max = min(1.0, midpoint + 0.025)
-            dynamic_min = self._ambient_dynamic_min
-            dynamic_max = self._ambient_dynamic_max
-
-        expanded_min = max(0.0, dynamic_min - 0.05)
-        expanded_max = min(1.0, dynamic_max + 0.10)
-        span = max(0.1, expanded_max - expanded_min)
-        normalized_linear = (ambient - expanded_min) / span
-        normalized_linear = max(0.0, min(1.0, normalized_linear))
-        normalized = normalized_linear ** self._auto_brightness_curve_gamma
-        if normalized_linear > 0.9:
-            boost = min(1.0, (normalized_linear - 0.9) / 0.1)
-            normalized += (1.0 - normalized) * 0.5 * boost
-        normalized = max(0.0, min(1.0, normalized))
-
-        if self._auto_brightness_verbose:
-            if (
-                self._ambient_calibration_last_log is None
-                or abs(dynamic_min - self._ambient_calibration_last_log[0]) > 0.02
-                or abs(dynamic_max - self._ambient_calibration_last_log[1]) > 0.02
-            ):
-                print(
-                    f"[AutoBrightness] Calibration range -> min={dynamic_min:.3f}, max={dynamic_max:.3f}, expanded=({expanded_min:.3f}-{expanded_max:.3f})",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                self._ambient_calibration_last_log = (dynamic_min, dynamic_max)
-
-        return self._auto_brightness_min + (self._auto_brightness_max - self._auto_brightness_min) * normalized
-
-    def _on_ambient_brightness_measured(self, ambient: float):
-        """Apply auto-brightness updates from ambient light monitor."""
-        if not self._auto_brightness_enabled:
-            return
-        
-        if self._auto_brightness_verbose:
-            if (
-                self._auto_log_last_measured is None
-                or abs(self._auto_log_last_measured - ambient) >= 0.02
-            ):
-                print(f"[AutoBrightness] Measured ambient: {ambient:.3f}", file=sys.stderr, flush=True)
-                self._auto_log_last_measured = ambient
-        
-        # Добавляем измерение в буфер
-        self._ambient_brightness_buffer.append(ambient)
-        if len(self._ambient_brightness_buffer) > self._ambient_brightness_buffer_size:
-            self._ambient_brightness_buffer.pop(0)
-        
-        # Вычисляем медиану для фильтрации выбросов
-        sorted_buffer = sorted(self._ambient_brightness_buffer)
-        if len(sorted_buffer) >= 2:
-            # Медиана: для 2 элементов - среднее, для больше - центральный
-            median_idx = len(sorted_buffer) // 2
-            if len(sorted_buffer) == 2:
-                filtered_ambient = (sorted_buffer[0] + sorted_buffer[1]) / 2
-            else:
-                filtered_ambient = sorted_buffer[median_idx]
-        else:
-            # Только одно измерение - используем его напрямую
-            filtered_ambient = self._ambient_brightness_buffer[0]
-        
-        target = self._map_ambient_to_user_brightness(filtered_ambient)
-        
-        previous_smoothed = self._auto_brightness_smoothed
-
-        if not self._auto_brightness_has_sample:
-            self._auto_brightness_has_sample = True
-            self._auto_brightness_smoothed = target
-        else:
-            smoothing = self._auto_brightness_smoothing
-            self._auto_brightness_smoothed = (
-                self._auto_brightness_smoothed * smoothing + target * (1.0 - smoothing)
-            )
-        
-        if self._auto_brightness_verbose:
-            if (
-                self._auto_log_last_target is None
-                or abs(self._auto_log_last_target - target) >= 0.015
-                or self._auto_log_last_smoothed is None
-                or abs(self._auto_log_last_smoothed - self._auto_brightness_smoothed) >= 0.015
-            ):
-                print(
-                    "[AutoBrightness] ambient={:.3f} -> filtered={:.3f} -> target={:.3f} -> smoothed={:.3f}".format(
-                        ambient,
-                        filtered_ambient,
-                        target,
-                        self._auto_brightness_smoothed,
-                    ),
-                    file=sys.stderr,
-                    flush=True,
-                )
-                self._auto_log_last_target = target
-                self._auto_log_last_smoothed = self._auto_brightness_smoothed
-        
-        diff = abs(self._auto_brightness_smoothed - getattr(self, "_user_brightness", 0.8))
-        
-        # Ограничиваем частоту перерисовок для устранения лагов
-        current_time = time.time()
-        if current_time - self._last_brightness_update_time < self._min_brightness_update_interval:
-            return
-        
-        self._last_brightness_update_time = current_time
-        if self._auto_brightness_verbose:
-            if abs(self._auto_brightness_smoothed - previous_smoothed) >= 0.01:
-                print(
-                    f"[AutoBrightness] Applying brightness: {self._auto_brightness_smoothed:.3f}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-        self._apply_brightness(self._auto_brightness_smoothed, from_auto=True)
-
-    def _on_ambient_light_error(self, error_code: str):
-        """Handle webcam errors during auto-brightness sampling."""
-        error_map = {
-            "missing_backend": "auto_brightness_error_backend",
-            "camera_unavailable": "auto_brightness_error_camera",
-            "capture_failed": "auto_brightness_error_capture",
-        }
-        message_key = error_map.get(error_code, "auto_brightness_error_generic")
-        self.show_notification(self._tr(message_key), duration=5000, notification_type="warning")
-        self._pending_auto_brightness_activation = False
-        self._auto_brightness_enabled = False
-        self._set_auto_brightness_controls_state()
-        self._apply_brightness(self._manual_brightness, from_auto=False)
-        self._teardown_ambient_monitor()
-        if not self._suppress_auto_brightness_save:
-            self.save_settings()
-
-    def _on_auto_brightness_camera_resolved(self, index: int):
-        """Persist resolved camera index after fallback probing."""
-        index = max(0, int(index))
-        if index == self._auto_brightness_camera_index:
-            return
-        self._auto_brightness_camera_index = index
-        if not self._suppress_auto_brightness_save:
-            self.save_settings()
-
-    def _teardown_ambient_monitor(self):
-        """Stop and dispose current ambient monitor instance if any."""
-        if self._ambient_light_monitor is None:
-            return
-
-        monitor = self._ambient_light_monitor
-        self._ambient_light_monitor = None
-
-        # Disconnect signals
-        try:
-            monitor.brightnessMeasured.disconnect(self._on_ambient_brightness_measured)
-        except (RuntimeError, TypeError):
-            pass
-        try:
-            monitor.errorOccurred.disconnect(self._on_ambient_light_error)
-        except (RuntimeError, TypeError):
-            pass
-        try:
-            monitor.cameraIndexResolved.disconnect(self._on_auto_brightness_camera_resolved)
-        except (RuntimeError, TypeError):
-            pass
-
-        # Async stop - don't block UI
-        monitor.stop()  # Sets _running = False
-
-        # Schedule cleanup with timeout for forceful termination if needed
-        def force_cleanup():
-            if monitor.isRunning():
-                print("[AutoBrightness] WARNING: Monitor thread still running after timeout, terminating", file=sys.stderr, flush=True)
-                monitor.terminate()  # Forceful stop
-            monitor.deleteLater()
-
-        # Give thread 500ms to stop gracefully, then force cleanup
-        QTimer.singleShot(500, force_cleanup)
-
-    def set_auto_brightness_enabled(self, enabled: bool, user_triggered: bool = False):
-        """Toggle webcam-based auto brightness."""
-        if enabled == self._auto_brightness_enabled and not self._pending_auto_brightness_activation:
-            self._set_auto_brightness_controls_state()
-            return
-
-        self._pending_auto_brightness_activation = False
-        self._auto_brightness_has_sample = False
-        deps_available = AmbientLightMonitor.dependencies_available()
-        if enabled and not deps_available:
-            self._auto_brightness_enabled = False
-            self._set_auto_brightness_controls_state()
-            self.show_notification(self._tr("auto_brightness_error_backend"), duration=5000, notification_type="warning")
-            if user_triggered and not self._suppress_auto_brightness_save:
-                self.save_settings()
-            return
-
-        self._auto_brightness_enabled = enabled
-        self._auto_brightness_smoothed = self._user_brightness
-
-        if enabled:
-            self._apply_auto_brightness_env_overrides()
-            self._ambient_dynamic_min = None
-            self._ambient_dynamic_max = None
-            # При включении автояркости пробуем найти системную подсветку,
-            # если она еще не инициализирована
-            if not self._system_backlight:
-                controller = SystemBacklightController.auto_detect()
-                if controller:
-                    self._system_backlight = controller
-                    if self._system_backlight_verbose:
-                        print(
-                            f"[Backlight] Auto-detected system backlight '{controller.name}' "
-                            f"for auto-brightness mode",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                    # Показываем уведомление о переходе на системную подсветку
-                    self.show_notification(
-                        self._tr("auto_brightness_system_backlight_enabled"),
-                        duration=3000,
-                        notification_type="info",
-                    )
-            
-            # При включении автояркости с системной подсветкой:
-            # устанавливаем UI яркость на максимум
-            if self._system_backlight:
-                if not math.isclose(self._user_brightness, 1.0, rel_tol=1e-3):
-                    self._user_brightness = 1.0
-                    self._update_cached_colors()
-                    self.update()
-            
-            # Очищаем буфер измерений при включении
-            self._ambient_brightness_buffer.clear()
-            self._teardown_ambient_monitor()
-            self._ambient_light_monitor = AmbientLightMonitor(
-                camera_index=self._auto_brightness_camera_index,
-                interval_ms=self._auto_brightness_interval_ms,
-                parent=self,
-            )
-            self._ambient_light_monitor.brightnessMeasured.connect(self._on_ambient_brightness_measured)
-            self._ambient_light_monitor.errorOccurred.connect(self._on_ambient_light_error)
-            self._ambient_light_monitor.cameraIndexResolved.connect(self._on_auto_brightness_camera_resolved)
-            self._ambient_light_monitor.start()
-        else:
-            self._teardown_ambient_monitor()
-            # При выключении возвращаемся к ручному управлению яркостью UI
-            self._apply_brightness(self._manual_brightness, from_auto=False)
-
-        self._set_auto_brightness_controls_state()
-
-        if user_triggered and not self._suppress_auto_brightness_save:
-            self.save_settings()
+        self.brightness_manager.set_manual_brightness(value / 100.0)
     def _create_download_progress_popup(self, parent=None):
         """Factory to create download progress popup with consistent parenting."""
         return DownloadProgressPopup(parent or self)
@@ -5714,22 +4203,24 @@ class NDotClockSlider(QWidget):
 
     def _update_cached_colors(self):
         """ARM-optimized: Update color cache with smart invalidation"""
+        brightness = self.brightness_manager.get_brightness()
+        
         digit_scaled = QColor(self._digit_color)
-        digit_scaled.setRed(int(digit_scaled.red() * self._user_brightness))
-        digit_scaled.setGreen(int(digit_scaled.green() * self._user_brightness))
-        digit_scaled.setBlue(int(digit_scaled.blue() * self._user_brightness))
+        digit_scaled.setRed(int(digit_scaled.red() * brightness))
+        digit_scaled.setGreen(int(digit_scaled.green() * brightness))
+        digit_scaled.setBlue(int(digit_scaled.blue() * brightness))
         self._digit_color_scaled = digit_scaled
 
         colon_scaled = QColor(self._colon_color)
-        colon_scaled.setRed(int(colon_scaled.red() * self._user_brightness))
-        colon_scaled.setGreen(int(colon_scaled.green() * self._user_brightness))
-        colon_scaled.setBlue(int(colon_scaled.blue() * self._user_brightness))
+        colon_scaled.setRed(int(colon_scaled.red() * brightness))
+        colon_scaled.setGreen(int(colon_scaled.green() * brightness))
+        colon_scaled.setBlue(int(colon_scaled.blue() * brightness))
         self._colon_color_scaled = colon_scaled
 
         date_color = QColor(self._digit_color)
-        date_color.setRed(int(date_color.red() * self._user_brightness * 0.6))
-        date_color.setGreen(int(date_color.green() * self._user_brightness * 0.6))
-        date_color.setBlue(int(date_color.blue() * self._user_brightness * 0.6))
+        date_color.setRed(int(date_color.red() * brightness * 0.6))
+        date_color.setGreen(int(date_color.green() * brightness * 0.6))
+        date_color.setBlue(int(date_color.blue() * brightness * 0.6))
         self._date_color = date_color
 
         # ARM optimization: Clear only digit pixmap cache, not glow dots (they use brightness buckets)
@@ -5765,24 +4256,8 @@ class NDotClockSlider(QWidget):
                     anim.deleteLater()
                 self._webview_fade_animations.clear()
 
-
-            # Clean up webviews with proper profile disposal
-            for attr in ('youtube_webview', 'home_assistant_webview'):
-                webview = getattr(self, attr, None)
-                if webview:
-                    webview.stop()  # Stop loading
-                    page = webview.page()
-                    if page:
-                        # Clean up profile to prevent memory leak
-                        profile = page.profile()
-                        if profile and not profile.isOffTheRecord():
-                            # Only delete non-shared profiles
-                            profile.deleteLater()
-                        page.deleteLater()
-                    webview.hide()
-                    webview.setParent(None)
-                    webview.deleteLater()
-                    setattr(self, attr, None)
+            # Clean up webviews
+            self.webview_manager.cleanup()
 
             self._teardown_ambient_monitor()
             self.save_settings()

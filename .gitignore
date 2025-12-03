@@ -7,22 +7,33 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+*.egg
+*.py[cod]
+*$py.class
 
 # Cookies and browser profiles
 cookies/
 
 # Settings (now stored in user config directories)
 ndot_clock_slider_settings.json
+ndot_clock_settings.json
+*.json.bak
 
 # IDE
 .vscode/
 .idea/
 .claude/
+*.swp
+*.swo
+*~
 
 # Virtual environment
 venv/
 env/
 .venv/
+ENV/
+env.bak/
+venv.bak/
 
 # OS specific
 .DS_Store
@@ -34,4 +45,35 @@ desktop.ini
 dist/
 build/
 ndot_clock_pyqt.py.backup
+
+# Testing
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+nosetests.xml
+*.log
+
+# Type checking
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+
+# Security reports
+bandit-report.json
+
+# Logs
+*.log
+logs/
+
+# Debug files
+debug.py
+debug_session_*.log
+
 

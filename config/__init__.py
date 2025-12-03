@@ -35,6 +35,15 @@ UPDATE_TARGETS = getattr(
 )
 
 from .localization import WEEKDAYS, MONTHS, TRANSLATIONS
+from .logging_config import setup_logging, get_logger, setup_qt_logging
+from .settings import (
+    ClockSettings,
+    AutoBrightnessSettings,
+    SlideConfig,
+    Location,
+    ColorRGB,
+    Language,
+)
 
 __all__ = [
     "__version__",
@@ -48,4 +57,13 @@ __all__ = [
     "WEEKDAYS",
     "MONTHS",
     "TRANSLATIONS",
+    "setup_logging",
+    "get_logger",
+    "setup_qt_logging",
+    "ClockSettings",
+    "AutoBrightnessSettings",
+    "SlideConfig",
+    "Location",
+    "ColorRGB",
+    "Language",
 ]

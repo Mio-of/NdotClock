@@ -1,18 +1,20 @@
 """Animated containers and panels used by the UI layer."""
 
 from enum import Enum
+from typing import Optional
 
 from PyQt6.QtCore import pyqtProperty
-from PyQt6.QtGui import QColor, QPainter
+from PyQt6.QtGui import QColor, QPainter, QPaintEvent
 from PyQt6.QtWidgets import QFrame, QGraphicsOpacityEffect, QWidget
 
 
 class SlideType(Enum):
+    """Types of slides available in the application."""
+    
     CLOCK = "clock"
     WEATHER = "weather"
     CUSTOM = "custom"
-    YOUTUBE = "youtube"
-    HOME_ASSISTANT = "home_assistant"
+    WEBVIEW = "webview"
     ADD = "add"
 
 

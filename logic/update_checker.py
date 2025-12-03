@@ -1,16 +1,19 @@
 """Update checking and application self-update workflow."""
 
 import json
+import logging
 import os
 import shutil
 import sys
 import tempfile
 import zipfile
-from typing import Callable, Optional
+from typing import Callable, Optional, Dict, Any
 
 from PyQt6.QtCore import QTimer, QUrl
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PyQt6.QtWidgets import QApplication
+
+logger = logging.getLogger(__name__)
 
 from config import (
     UPDATE_TARGETS,
@@ -64,13 +67,14 @@ class UpdateChecker:
         if redirect_attr is not None and redirect_policy is not None:
             request.setAttribute(redirect_attr, redirect_policy)
 
-    def check_for_updates(self, silent: bool = False):
-        """Check for updates from GitHub main branch
+    def check_for_updates(self, silent: bool = False) -> None:
+        """Check for updates from GitHub main branch.
 
         Args:
             silent: If True, only show notification if update is available
         """
         if self._check_in_progress:
+            logger.debug("Update check already in progress")
             if not silent:
                 self.parent.show_notification(
                     "Update check already in progress...",
@@ -79,6 +83,7 @@ class UpdateChecker:
                 )
             return
 
+        logger.info(f"Checking for updates (current version: {__version__})")
         self.silent = silent
         self.current_request_type = 'check'
         self._check_in_progress = True
@@ -89,12 +94,18 @@ class UpdateChecker:
         self._apply_redirect_policy(request)
         self.network_manager.get(request)
 
-    def _on_update_check_finished(self, reply: QNetworkReply):
-        """Handle update check response"""
+    def _on_update_check_finished(self, reply: QNetworkReply) -> None:
+        """Handle update check response.
+        
+        Args:
+            reply: Network reply from GitHub API
+        """
         if reply.error() != QNetworkReply.NetworkError.NoError:
+            error_msg = reply.errorString()
+            logger.error(f"Update check failed ({self.current_request_type}): {error_msg}")
             if not self.silent and self.current_request_type == 'check':
                 self.parent.show_notification(
-                    f"Failed to check for updates: {reply.errorString()}",
+                    f"Failed to check for updates: {error_msg}",
                     duration=4000,
                     notification_type="error"
                 )

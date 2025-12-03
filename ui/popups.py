@@ -381,12 +381,12 @@ class ConfirmationPopup(QWidget):
 
             self.fade_animation.start()
 
-    def on_confirm(self):
+    def on_confirm(self, checked=False):
         """Handle confirm button"""
         self.confirmed.emit()
         self.close()
 
-    def on_cancel(self):
+    def on_cancel(self, checked=False):
         """Handle cancel button"""
         self.cancelled.emit()
         self.close()
