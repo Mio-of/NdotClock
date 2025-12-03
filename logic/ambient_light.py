@@ -316,11 +316,10 @@ class AmbientLightMonitor(QThread):
                 backends = [cv2.CAP_DSHOW]
             elif self._is_raspberry_pi:
                 if self._verbose:
-                    print("[AutoBrightness] Raspberry Pi detected", file=sys.stderr, flush=True)
-                # Для Raspberry Pi пробуем только V4L2 с индексами
-                # GStreamer требует pipeline, а не индекс, поэтому пробуем его отдельно
-                # Avoid CAP_ANY on Pi as it might trigger obsensor crash
-                backends = [cv2.CAP_V4L2]
+                    print("[AutoBrightness] Raspberry Pi detected - skipping unsafe index probing", file=sys.stderr, flush=True)
+                # On Raspberry Pi, probing indices (cv2.VideoCapture(0)) often causes segfaults with recent OpenCV/libcamera versions.
+                # We rely solely on GStreamer pipelines (tried above) or Picamera2 (tried below).
+                backends = [] 
             else:
                 backends = [cv2.CAP_V4L2, cv2.CAP_ANY]
             
@@ -625,20 +624,8 @@ class AmbientLightMonitor(QThread):
         if env_pipeline:
             pipelines.append(("env", env_pipeline))
 
-        # Try v4l2src with common video devices (works on RPi 5 with CSI cameras)
-        # Probe video0-7 as these are typically CSI camera interfaces
-        for idx in range(8):
-            device = f"/dev/video{idx}"
-            if os.path.exists(device):
-                pipelines.append(
-                    (
-                        f"v4l2src-{idx}",
-                        f"v4l2src device={device} ! video/x-raw,width=640,height=480 "
-                        f"! videoconvert ! video/x-raw,format=BGR ! appsink drop=true",
-                    )
-                )
-
         # Default libcamera pipeline suitable for modern Raspberry Pi OS images.
+        # WE TRY THIS FIRST on Pi 5 to avoid touching /dev/video* which might segfault
         pipelines.append(
             (
                 "libcamerasrc-bgr",
@@ -653,6 +640,20 @@ class AmbientLightMonitor(QThread):
                 "! videoconvert ! video/x-raw,format=RGB ! appsink drop=true",
             )
         )
+
+        # Try v4l2src with common video devices (works on RPi 5 with CSI cameras)
+        # Probe video0-7 as these are typically CSI camera interfaces
+        for idx in range(8):
+            device = f"/dev/video{idx}"
+            if os.path.exists(device):
+                pipelines.append(
+                    (
+                        f"v4l2src-{idx}",
+                        f"v4l2src device={device} ! video/x-raw,width=640,height=480 "
+                        f"! videoconvert ! video/x-raw,format=BGR ! appsink drop=true",
+                    )
+                )
+
         # Legacy pipeline for older Raspberry Pi distributions with rpicamsrc.
         pipelines.append(
             (
