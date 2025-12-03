@@ -444,6 +444,8 @@ class NDotClockSlider(QWidget):
             # 0.0 brightness -> 1.0 opacity
             # Note: BrightnessManager clamps min brightness to 0.05
             self.brightness_overlay.set_opacity(1.0 - value)
+        else:
+            self.brightness_overlay.hide()
             
         self.update()
         
