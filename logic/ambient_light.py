@@ -633,18 +633,19 @@ class AmbientLightMonitor(QThread):
 
         # Default libcamera pipeline suitable for modern Raspberry Pi OS images.
         # WE TRY THIS FIRST on Pi 5 to avoid touching /dev/video* which might segfault
+        # Note: Let libcamera handle the initial format, then convert to BGR
         pipelines.append(
             (
                 "libcamerasrc-bgr",
-                "libcamerasrc ! video/x-raw,width=640,height=480,framerate=30/1 "
-                "! videoconvert ! video/x-raw,format=BGR ! appsink drop=true",
+                "libcamerasrc ! videoconvert ! video/x-raw,format=BGR,width=640,height=480 "
+                "! appsink drop=true",
             )
         )
         pipelines.append(
             (
                 "libcamerasrc-rgb",
-                "libcamerasrc ! video/x-raw,width=640,height=480,framerate=30/1 "
-                "! videoconvert ! video/x-raw,format=RGB ! appsink drop=true",
+                "libcamerasrc ! videoconvert ! video/x-raw,format=RGB,width=640,height=480 "
+                "! appsink drop=true",
             )
         )
 

@@ -1,12 +1,26 @@
 import os
 from typing import Optional
-from PyQt6.QtCore import QUrl, QTimer, Qt, QRectF
+from PyQt6.QtCore import QUrl, QTimer, Qt, QRectF, pyqtSignal, pyqtSlot, QObject
 from PyQt6.QtGui import QColor, QPainterPath, QRegion
+from PyQt6.QtWebChannel import QWebChannel
 # Note: QGraphicsOpacityEffect removed - causes window recreation with WebEngine
 from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile, QWebEngineSettings
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 
 from ui.utils import get_config_dir
+
+
+class KeyboardBridge(QObject):
+    """Bridge to communicate between JavaScript and Python for keyboard"""
+    keyboardRequested = pyqtSignal(str, str)  # element_id, current_value
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+    
+    @pyqtSlot(str, str)
+    def requestKeyboard(self, element_id: str, current_value: str):
+        """Called from JavaScript when input is focused"""
+        self.keyboardRequested.emit(element_id, current_value)
 
 
 class SilentWebEnginePage(QWebEnginePage):
@@ -28,6 +42,9 @@ class WebviewManager:
         # Cache geometry to avoid redundant updates
         self._last_mask_size: Optional[tuple[int, int]] = None
         self._last_geometry: Optional[tuple[int, int, int, int]] = None
+        
+        # Scroll position cache per URL
+        self._scroll_positions: dict[str, tuple[int, int]] = {}  # url -> (x, y)
 
     @property
     def webview(self) -> Optional[QWebEngineView]:
@@ -124,6 +141,14 @@ class WebviewManager:
         view = QWebEngineView(self.parent)
         view.setPage(page)
         
+        # Setup WebChannel for keyboard bridge
+        channel = QWebChannel(page)
+        bridge = KeyboardBridge(view)
+        bridge.keyboardRequested.connect(self._on_keyboard_requested)
+        channel.registerObject("keyboardBridge", bridge)
+        page.setWebChannel(channel)
+        view._keyboard_bridge = bridge
+        
         # Initialize view state
         view.page_loaded = False
         view.error_message = ""
@@ -141,6 +166,7 @@ class WebviewManager:
         view.setUpdatesEnabled(True)
 
         view.loadFinished.connect(lambda success: self.on_webview_load_finished(view, success))
+        view.urlChanged.connect(lambda url: self._on_url_changed(view, url))
 
         settings = view.settings()
         settings.setAttribute(QWebEngineSettings.WebAttribute.LocalStorageEnabled, True)
@@ -155,7 +181,7 @@ class WebviewManager:
         if hasattr(QWebEngineSettings.WebAttribute, 'TouchIconsEnabled'):
             settings.setAttribute(QWebEngineSettings.WebAttribute.TouchIconsEnabled, True)
 
-        view.page().setBackgroundColor(QColor(255, 255, 255))
+        view.page().setBackgroundColor(QColor(30, 30, 30))  # Dark background
         view.installEventFilter(self.parent)
         view.setAttribute(Qt.WidgetAttribute.WA_AcceptTouchEvents, True)
         # Ensure child widget (focusProxy) also accepts touch events
@@ -163,7 +189,12 @@ class WebviewManager:
             view.focusProxy().setAttribute(Qt.WidgetAttribute.WA_AcceptTouchEvents, True)
         
         border_radius = self._border_radius_px()
-        view.setStyleSheet(f"QWebEngineView {{ border-radius: {border_radius}px; background: white; }}")
+        view.setStyleSheet(f"QWebEngineView {{ border-radius: {border_radius}px; background: #1e1e1e; }}")
+        
+        # Enable dark mode preference
+        view.page().profile().setHttpUserAgent(
+            view.page().profile().httpUserAgent() + " prefers-color-scheme: dark"
+        )
         view.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         
         view.setUpdatesEnabled(True)
@@ -276,6 +307,8 @@ class WebviewManager:
             view.page_loaded = True
             view.error_message = ""
             view.error_notified = False
+            # Inject keyboard helper script
+            self._inject_keyboard_script(view)
         else:
             view.error_message = "Failed to load page"
             view.page_loaded = False
@@ -290,7 +323,90 @@ class WebviewManager:
         if self.webview == view:
             if hasattr(self.parent, 'on_webview_load_finished_callback'):
                 self.parent.on_webview_load_finished_callback(success)
+    
+    def _inject_keyboard_script(self, view: QWebEngineView):
+        """Inject JavaScript to handle input focus for on-screen keyboard"""
+        script = """
+        (function() {
+            if (window._keyboardHelperInstalled) return;
+            window._keyboardHelperInstalled = true;
+            
+            // Force dark color scheme
+            var meta = document.createElement('meta');
+            meta.name = 'color-scheme';
+            meta.content = 'dark';
+            document.head.appendChild(meta);
+            
+            // Override prefers-color-scheme media query
+            try {
+                Object.defineProperty(window, 'matchMedia', {
+                    writable: true,
+                    value: function(query) {
+                        if (query === '(prefers-color-scheme: dark)') {
+                            return { matches: true, media: query, addListener: function(){}, removeListener: function(){}, addEventListener: function(){}, removeEventListener: function(){} };
+                        }
+                        if (query === '(prefers-color-scheme: light)') {
+                            return { matches: false, media: query, addListener: function(){}, removeListener: function(){}, addEventListener: function(){}, removeEventListener: function(){} };
+                        }
+                        return window._originalMatchMedia ? window._originalMatchMedia(query) : { matches: false, media: query, addListener: function(){}, removeListener: function(){}, addEventListener: function(){}, removeEventListener: function(){} };
+                    }
+                });
+            } catch(e) {}
+            
+            // Load QWebChannel
+            var script = document.createElement('script');
+            script.src = 'qrc:///qtwebchannel/qwebchannel.js';
+            script.onload = function() {
+                new QWebChannel(qt.webChannelTransport, function(channel) {
+                    window.keyboardBridge = channel.objects.keyboardBridge;
+                    
+                    // Handle focus on input/textarea
+                    document.addEventListener('focusin', function(e) {
+                        var el = e.target;
+                        if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+                            var type = el.type || 'text';
+                            if (type !== 'hidden' && type !== 'checkbox' && type !== 'radio' && type !== 'submit' && type !== 'button') {
+                                window._activeInput = el;
+                                window.keyboardBridge.requestKeyboard(el.id || 'input', el.value || '');
+                            }
+                        }
+                    });
+                });
+            };
+            document.head.appendChild(script);
+        })();
+        """
+        view.page().runJavaScript(script)
+    
+    def _on_keyboard_requested(self, element_id: str, current_value: str):
+        """Handle keyboard request from webview"""
+        if hasattr(self.parent, 'show_webview_keyboard'):
+            self.parent.show_webview_keyboard(element_id, current_value)
+    
+    def set_input_value(self, value: str):
+        """Set value to the active input in webview"""
+        view = self.webview
+        if view and view.page_loaded:
+            escaped = value.replace('\\', '\\\\').replace("'", "\\'").replace('\n', '\\n')
+            script = f"""
+            if (window._activeInput) {{
+                window._activeInput.value = '{escaped}';
+                window._activeInput.dispatchEvent(new Event('input', {{ bubbles: true }}));
+            }}
+            """
+            view.page().runJavaScript(script)
 
+    def _on_url_changed(self, view: QWebEngineView, url: QUrl):
+        """Handle URL change - save current URL to slide settings"""
+        if not view.page_loaded:
+            return  # Don't save during initial load
+        
+        new_url = url.toString()
+        url_key = getattr(view, '_url_key', None)
+        
+        if url_key and new_url and hasattr(self.parent, 'update_webview_url'):
+            self.parent.update_webview_url(url_key, new_url)
+    
     def _on_load_timeout(self, view: QWebEngineView):
         """Handle load timeout"""
         view.error_message = "Page load timeout"

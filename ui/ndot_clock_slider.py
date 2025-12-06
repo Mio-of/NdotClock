@@ -79,7 +79,7 @@ from logic import (
 )
 from ui.animations import AnimatedPanel, AnimatedSlideContainer, SlideType
 from ui.controls import ModernColorButton, ModernSlider
-from ui.popups import ConfirmationPopup, DownloadProgressPopup, NotificationPopup
+from ui.popups import ConfirmationPopup, DownloadProgressPopup, NotificationPopup, WiFiPopup, TextInputPopup
 from ui.brightness import BrightnessManager
 from ui.webviews import WebviewManager
 from ui.settings_manager import SettingsManager
@@ -180,8 +180,10 @@ class NDotClockSlider(QWidget):
         self._colon_color = settings['colon_color']
         self.current_language = settings['language']
         self.slides = settings['slides']
+        self._ensure_slide_order()  # Ensure CLOCK first, ADD last
         self.location_lat = settings['location']['lat']
         self.location_lon = settings['location']['lon']
+        self.location_city = settings['location'].get('city', '')
         self.is_fullscreen = settings['fullscreen']
         
         # Initialize Brightness Manager
@@ -422,10 +424,7 @@ class NDotClockSlider(QWidget):
         # 1. Configure Brightness Manager
         # This might start the camera, so we do it first but safely
         def init_brightness():
-            import sys
-            print(f"[InitBrightness] has _initial_settings: {hasattr(self, '_initial_settings')}", file=sys.stderr, flush=True)
             if hasattr(self, '_initial_settings'):
-                print(f"[InitBrightness] auto_brightness_enabled = {self._initial_settings.get('auto_brightness_enabled')}", file=sys.stderr, flush=True)
                 self.brightness_manager.configure(self._initial_settings)
                 del self._initial_settings
         
@@ -444,19 +443,17 @@ class NDotClockSlider(QWidget):
                     # 800ms delay between heavy webview loads
                     self.task_queue.add_task(load_webview_task, f"Load Webview {i}", delay_ms=800)
         
-        # 3. Fetch weather (delayed)
-        # Add weather fetch as a task with a larger delay after webviews
-        self.task_queue.add_task(self.fetch_weather, "Fetch Weather", delay_ms=1500)
+        # 3. Fetch location (for timezone sync) and weather
+        # Always fetch location at startup to sync timezone
+        self.task_queue.add_task(self.fetch_location, "Fetch Location", delay_ms=1500)
         
         # Start the queue
         self.task_queue.start()
 
     def _restore_window_state(self):
         """Restore window state - ensure fullscreen is properly applied."""
-        print(f"[RestoreWindowState] is_fullscreen = {self.is_fullscreen}")
         # Only re-apply fullscreen if somehow it was lost (safety net)
         if self.is_fullscreen and not self.isFullScreen():
-            print("[RestoreWindowState] Re-applying showFullScreen()")
             self.showFullScreen()
         if self.is_fullscreen:
             self.setFocus(Qt.FocusReason.OtherFocusReason)
@@ -900,6 +897,32 @@ class NDotClockSlider(QWidget):
             # Also reset the clock return timer if we're not on the clock slide
             self.reset_clock_return_timer()
 
+    def _ensure_slide_order(self):
+        """Ensure CLOCK is always first and ADD is always last"""
+        if not self.slides:
+            return
+        
+        # Find CLOCK and ADD slides
+        clock_slide = None
+        add_slide = None
+        other_slides = []
+        
+        for slide in self.slides:
+            if slide.get('type') == SlideType.CLOCK:
+                clock_slide = slide
+            elif slide.get('type') == SlideType.ADD:
+                add_slide = slide
+            else:
+                other_slides.append(slide)
+        
+        # Rebuild slides list: CLOCK first, others in middle, ADD last
+        self.slides = []
+        if clock_slide:
+            self.slides.append(clock_slide)
+        self.slides.extend(other_slides)
+        if add_slide:
+            self.slides.append(add_slide)
+    
     def reset_clock_return_timer(self):
         """Reset the timer that returns to clock slide after inactivity"""
         # Only start timer if we're not on clock slide and not in edit mode
@@ -1019,14 +1042,48 @@ class NDotClockSlider(QWidget):
         # ipapi.co uses 'latitude' and 'longitude' keys
         self.location_lat = data.get('latitude')
         self.location_lon = data.get('longitude')
+        self.location_city = data.get('city', '')
+        timezone = data.get('timezone')
 
         if self.location_lat and self.location_lon:
+            # Set system timezone if available
+            if timezone:
+                self._set_system_timezone(timezone)
             # Save to settings
             self.save_settings()
             # Fetch weather with new location
             self.fetch_weather()
         else:
             self.weather_status_message = "Location unavailable"
+    
+    def _set_system_timezone(self, timezone: str):
+        """Set system timezone based on location"""
+        import subprocess
+        try:
+            # Check if timezone is valid
+            result = subprocess.run(
+                ['timedatectl', 'list-timezones'],
+                capture_output=True, text=True, timeout=5
+            )
+            valid_timezones = result.stdout.strip().split('\n')
+            
+            if timezone in valid_timezones:
+                # Get current timezone
+                current = subprocess.run(
+                    ['timedatectl', 'show', '--property=Timezone', '--value'],
+                    capture_output=True, text=True, timeout=5
+                )
+                current_tz = current.stdout.strip()
+                
+                # Only set if different
+                if current_tz != timezone:
+                    subprocess.run(
+                        ['sudo', 'timedatectl', 'set-timezone', timezone],
+                        capture_output=True, timeout=10
+                    )
+                    logging.info(f"Timezone set to {timezone}")
+        except Exception as e:
+            logging.warning(f"Failed to set timezone: {e}")
 
     def fetch_weather(self):
         """Fetch weather data from API"""
@@ -1140,12 +1197,15 @@ class NDotClockSlider(QWidget):
                 # Check if clicking on a card to potentially start reordering
                 card_index = self.get_card_at_position(event.pos())
                 if card_index is not None and card_index < len(self.slides):
-                    # Start timer for reordering activation (1 second hold)
-                    self.reorder_pending_index = card_index
-                    self.press_start_pos = event.pos()
-                    self.mouse_pressed = True
-                    self.reorder_activation_timer.start(1000)
-                    return
+                    slide_type = self.slides[card_index].get('type')
+                    # Clock (always first) and Add (always last) cards cannot be reordered
+                    if slide_type not in (SlideType.CLOCK, SlideType.ADD):
+                        # Start timer for reordering activation (1.5 second hold - less sensitive)
+                        self.reorder_pending_index = card_index
+                        self.press_start_pos = event.pos()
+                        self.mouse_pressed = True
+                        self.reorder_activation_timer.start(1500)
+                        return
 
                 # Otherwise start drag detection
                 self.mouse_pressed = True
@@ -1167,15 +1227,44 @@ class NDotClockSlider(QWidget):
             # Handle card reordering in edit mode
             if self.is_reordering_card and self.reorder_drag_index is not None:
                 delta = QPointF(event.pos() - self.press_start_pos)
-                self.reorder_drag_offset = delta
+                
+                # Limit drag offset to prevent card from flying too far
+                # Card can only move between position 1 and len-2 (not to CLOCK or ADD positions)
+                card_width = self.width()
+                drag_idx = self.reorder_drag_index
+                
+                # Calculate allowed range (positions 1 to len-2)
+                min_allowed_idx = 1
+                max_allowed_idx = len(self.slides) - 2
+                
+                # Max offset left: can't go past position 1
+                max_left = -(drag_idx - min_allowed_idx) * card_width - card_width * 0.3
+                # Max offset right: can't go past position len-2
+                max_right = (max_allowed_idx - drag_idx) * card_width + card_width * 0.3
+                
+                # Clamp the delta with rubber band effect at edges
+                clamped_x = delta.x()
+                if clamped_x < max_left:
+                    # Rubber band effect - resistance when pulling past limit
+                    overshoot = max_left - clamped_x
+                    clamped_x = max_left - overshoot * 0.2
+                elif clamped_x > max_right:
+                    overshoot = clamped_x - max_right
+                    clamped_x = max_right + overshoot * 0.2
+                
+                self.reorder_drag_offset = QPointF(clamped_x, delta.y() * 0.3)  # Also limit vertical movement
                 self._update_reorder_auto_scroll(event.pos())
 
                 # Check if we should swap with another card
                 new_target = self.get_card_at_position(event.pos())
                 if new_target is not None and new_target != self.reorder_target_index:
-                    # исправлено: анимируем все карточки к правильным позициям относительно drag_index
-                    self.reorder_target_index = new_target
-                    self.animate_card_reordering()
+                    # Don't allow swapping with CLOCK (index 0) or ADD (last index) cards
+                    target_type = self.slides[new_target].get('type') if new_target < len(self.slides) else None
+                    # Also prevent moving to position 0 (reserved for CLOCK) or last position (reserved for ADD)
+                    is_reserved_position = (new_target == 0 or new_target == len(self.slides) - 1)
+                    if target_type not in (SlideType.CLOCK, SlideType.ADD) and not is_reserved_position:
+                        self.reorder_target_index = new_target
+                        self.animate_card_reordering()
 
                 self.update()
                 return
@@ -1184,7 +1273,8 @@ class NDotClockSlider(QWidget):
             delta_y = abs(event.pos().y() - self.press_start_pos.y())
 
             # If moved while waiting for reorder activation, cancel it and allow swipe
-            if self.reorder_activation_timer.isActive() and (abs(delta_x) > 5 or delta_y > 5):
+            # Increased threshold to 15px to be less sensitive
+            if self.reorder_activation_timer.isActive() and (abs(delta_x) > 15 or delta_y > 15):
                 self.reorder_activation_timer.stop()
                 self.reorder_pending_index = None
 
@@ -1247,17 +1337,26 @@ class NDotClockSlider(QWidget):
                 self._last_reorder_cursor_pos = None
                 # Finalize the swap
                 if self.reorder_target_index != self.reorder_drag_index:
-                    # Actually swap the slides in the array
-                    self.slides[self.reorder_drag_index], self.slides[self.reorder_target_index] = \
-                        self.slides[self.reorder_target_index], self.slides[self.reorder_drag_index]
+                    # Verify target is valid (not CLOCK position 0, not ADD position last)
+                    target_valid = (
+                        self.reorder_target_index > 0 and 
+                        self.reorder_target_index < len(self.slides) - 1
+                    )
+                    
+                    if target_valid:
+                        # Actually swap the slides in the array
+                        self.slides[self.reorder_drag_index], self.slides[self.reorder_target_index] = \
+                            self.slides[self.reorder_target_index], self.slides[self.reorder_drag_index]
 
-                    # Update current_slide if we swapped the active card
-                    if self.current_slide == self.reorder_drag_index:
-                        self.current_slide = self.reorder_target_index
-                    elif self.current_slide == self.reorder_target_index:
-                        self.current_slide = self.reorder_drag_index
+                        # Update current_slide if we swapped the active card
+                        if self.current_slide == self.reorder_drag_index:
+                            self.current_slide = self.reorder_target_index
+                        elif self.current_slide == self.reorder_target_index:
+                            self.current_slide = self.reorder_drag_index
 
-                    self.save_settings()
+                        # Ensure CLOCK stays first and ADD stays last
+                        self._ensure_slide_order()
+                        self.save_settings()
 
                 # Reset reordering state
                 self.is_reordering_card = False
@@ -1301,9 +1400,9 @@ class NDotClockSlider(QWidget):
 
                 if should_change_slide:
                     if delta_x < 0:  # Swiped left
-                        self.next_slide()
+                        self.next_slide(calculated_velocity)
                     else:  # Swiped right
-                        self.previous_slide()
+                        self.previous_slide(calculated_velocity)
                 else:
                     # Snap back to current slide
                     self.animate_to_current_slide()
@@ -1527,6 +1626,14 @@ class NDotClockSlider(QWidget):
             # Пропускаем перетаскиваемую карточку - она управляется reorder_drag_offset
             if idx == drag_idx:
                 continue
+            
+            # CLOCK (index 0) и ADD (last index) никогда не двигаются
+            # Проверяем и по типу и по позиции
+            if idx == 0 or idx == len(self.slides) - 1:
+                continue
+            slide_type = self.slides[idx].get('type') if idx < len(self.slides) else None
+            if slide_type in (SlideType.CLOCK, SlideType.ADD):
+                continue
 
             # Определяем целевое смещение для каждой карточки
             target_offset = 0.0
@@ -1605,13 +1712,16 @@ class NDotClockSlider(QWidget):
             language_rects.append((lang, QRect(x, lang_y, button_width, button_height)))
 
         pill_width = self.get_ui_size(120, 92)
+        wifi_width = self.get_ui_size(70, 54)
         margin_side = self.get_spacing(20, 14)
         autostart_rect = QRect(margin_side, lang_y, pill_width, button_height)
+        wifi_rect = QRect(margin_side + pill_width + lang_spacing, lang_y, wifi_width, button_height)
         update_rect = QRect(self.width() - pill_width - margin_side, lang_y, pill_width, button_height)
 
         layout = {
             "language_rects": language_rects,
             "autostart_rect": autostart_rect,
+            "wifi_rect": wifi_rect,
             "update_rect": update_rect,
             "button_height": button_height,
             "baseline_y": lang_y,
@@ -1630,6 +1740,12 @@ class NDotClockSlider(QWidget):
         if autostart_rect.contains(pos):
             self._prepare_control_click(pos)
             self.toggle_autostart()
+            return True
+
+        wifi_rect = layout["wifi_rect"]
+        if wifi_rect.contains(pos):
+            self._prepare_control_click(pos)
+            self.open_wifi_settings()
             return True
 
         update_rect = layout["update_rect"]
@@ -1719,6 +1835,109 @@ class NDotClockSlider(QWidget):
 
         # Update UI to reflect new state
         self.update()
+
+    def open_wifi_settings(self):
+        """Open WiFi settings popup"""
+        # Close any existing wifi popup
+        if hasattr(self, '_wifi_popup') and self._wifi_popup:
+            self._wifi_popup.close()
+        
+        self._wifi_popup = WiFiPopup(self)
+        self._wifi_popup.closed.connect(self._on_wifi_popup_closed)
+        self._wifi_popup.show()
+    
+    def _on_wifi_popup_closed(self):
+        """Handle WiFi popup close"""
+        self._wifi_popup = None
+
+    def _show_text_input_popup(self, field_name: str, target_input: QLineEdit):
+        """Show text input popup with keyboard for the given input field"""
+        if hasattr(self, '_text_input_popup') and self._text_input_popup:
+            self._text_input_popup.close()
+        
+        # Store field name instead of widget reference
+        self._text_input_field = field_name
+        self._text_input_popup = TextInputPopup(
+            self, 
+            title=f"Enter {field_name}",
+            initial_text=target_input.text(),
+            placeholder=f"Enter {field_name.lower()}..."
+        )
+        self._text_input_popup.text_entered.connect(self._on_text_input_entered)
+        self._text_input_popup.cancelled.connect(self._on_text_input_cancelled)
+        self._text_input_popup.show()
+    
+    def _on_text_input_entered(self, text: str):
+        """Handle text entered from popup"""
+        field = getattr(self, '_text_input_field', None)
+        if field == "URL" and hasattr(self, 'webview_url_input'):
+            try:
+                self.webview_url_input.setText(text)
+            except RuntimeError:
+                pass
+        elif field == "Title" and hasattr(self, 'webview_title_input'):
+            try:
+                self.webview_title_input.setText(text)
+            except RuntimeError:
+                pass
+        self._text_input_popup = None
+        self._text_input_field = None
+    
+    def _on_text_input_cancelled(self):
+        """Handle text input popup cancelled"""
+        self._text_input_popup = None
+        self._text_input_field = None
+
+    def update_webview_url(self, original_url: str, new_url: str):
+        """Update webview URL in slide settings when user navigates"""
+        if original_url == new_url:
+            return
+        
+        # Find the slide with this original URL and update it
+        for slide in self.slides:
+            if slide.get('type') == SlideType.WEBVIEW:
+                if slide.get('data', {}).get('url') == original_url:
+                    slide['data']['url'] = new_url
+                    self.save_settings()
+                    break
+    
+    def show_webview_keyboard(self, element_id: str, current_value: str):
+        """Show keyboard for webview input field"""
+        # Don't reopen if already showing or recently closed
+        if hasattr(self, '_webview_keyboard_popup') and self._webview_keyboard_popup:
+            return
+        if hasattr(self, '_webview_keyboard_cooldown') and self._webview_keyboard_cooldown:
+            return
+        
+        self._webview_keyboard_popup = TextInputPopup(
+            self,
+            title="Enter Text",
+            initial_text=current_value,
+            placeholder="Type here..."
+        )
+        self._webview_keyboard_popup.text_entered.connect(self._on_webview_keyboard_entered)
+        self._webview_keyboard_popup.cancelled.connect(self._on_webview_keyboard_cancelled)
+        self._webview_keyboard_popup.show()
+    
+    def _on_webview_keyboard_entered(self, text: str):
+        """Handle text entered for webview"""
+        if hasattr(self, 'webview_manager') and self.webview_manager:
+            self.webview_manager.set_input_value(text)
+        self._webview_keyboard_popup = None
+        # Cooldown to prevent immediate reopen
+        self._webview_keyboard_cooldown = True
+        QTimer.singleShot(500, self._clear_keyboard_cooldown)
+    
+    def _on_webview_keyboard_cancelled(self):
+        """Handle webview keyboard cancelled"""
+        self._webview_keyboard_popup = None
+        # Cooldown to prevent immediate reopen
+        self._webview_keyboard_cooldown = True
+        QTimer.singleShot(500, self._clear_keyboard_cooldown)
+    
+    def _clear_keyboard_cooldown(self):
+        """Clear keyboard cooldown"""
+        self._webview_keyboard_cooldown = False
 
     def is_click_on_current_card(self, pos: QPoint) -> bool:
         """Detect clicks on the active slide in normal mode"""
@@ -2341,14 +2560,18 @@ class NDotClockSlider(QWidget):
         url_label.setStyleSheet(f"color: #ccc; font-size: {url_label_font_size}px; font-family: '{self.font_family}';")
         layout.addWidget(url_label)
 
-        self.webview_url_input = QLineEdit()
-        self.webview_url_input.setText(
-            self.slides[self.current_edit_index]['data'].get('url', '')
-        )
         input_height = self.get_ui_size(32, 26)
         input_font_size = self.get_ui_size(12, 10)
         input_padding = self.get_ui_size(8, 6)
         input_radius = self.get_ui_size(6, 4)
+        
+        url_row = QHBoxLayout()
+        url_row.setSpacing(6)
+        
+        self.webview_url_input = QLineEdit()
+        self.webview_url_input.setText(
+            self.slides[self.current_edit_index]['data'].get('url', '')
+        )
         self.webview_url_input.setMinimumHeight(input_height)
         self.webview_url_input.setStyleSheet(f"""
             QLineEdit {{
@@ -2361,7 +2584,24 @@ class NDotClockSlider(QWidget):
                 font-family: '{self.font_family}';
             }}
         """)
-        layout.addWidget(self.webview_url_input)
+        url_row.addWidget(self.webview_url_input)
+        
+        url_kbd_btn = QPushButton("⌨")
+        url_kbd_btn.setFixedSize(input_height, input_height)
+        url_kbd_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: rgba(255, 255, 255, 15);
+                border: 1px solid rgba(255, 255, 255, 20);
+                border-radius: {input_radius}px;
+                color: #aaa;
+                font-size: 14px;
+            }}
+            QPushButton:pressed {{ background-color: rgba(255, 255, 255, 30); }}
+        """)
+        url_kbd_btn.clicked.connect(lambda: self._show_text_input_popup("URL", self.webview_url_input))
+        url_row.addWidget(url_kbd_btn)
+        
+        layout.addLayout(url_row)
 
         layout.addSpacing(self.get_spacing(12, 8))
 
@@ -2371,6 +2611,9 @@ class NDotClockSlider(QWidget):
         title_label.setStyleSheet(f"color: #ccc; font-size: {url_label_font_size}px; font-family: '{self.font_family}';")
         layout.addWidget(title_label)
 
+        title_row = QHBoxLayout()
+        title_row.setSpacing(6)
+        
         self.webview_title_input = QLineEdit()
         self.webview_title_input.setText(
             self.slides[self.current_edit_index]['data'].get('title', self._tr('youtube_default_title'))
@@ -2387,7 +2630,24 @@ class NDotClockSlider(QWidget):
                 font-family: '{self.font_family}';
             }}
         """)
-        layout.addWidget(self.webview_title_input)
+        title_row.addWidget(self.webview_title_input)
+        
+        title_kbd_btn = QPushButton("⌨")
+        title_kbd_btn.setFixedSize(input_height, input_height)
+        title_kbd_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: rgba(255, 255, 255, 15);
+                border: 1px solid rgba(255, 255, 255, 20);
+                border-radius: {input_radius}px;
+                color: #aaa;
+                font-size: 14px;
+            }}
+            QPushButton:pressed {{ background-color: rgba(255, 255, 255, 30); }}
+        """)
+        title_kbd_btn.clicked.connect(lambda: self._show_text_input_popup("Title", self.webview_title_input))
+        title_row.addWidget(title_kbd_btn)
+        
+        layout.addLayout(title_row)
 
         layout.addStretch()
 
@@ -2573,29 +2833,55 @@ class NDotClockSlider(QWidget):
         self._edit_mode_entry_slide = self.current_slide
         # Don't call update_active_webviews() here - it will be called after animations finish
 
-    def next_slide(self):
+    def next_slide(self, velocity: float = 0):
         """Move to next slide"""
         if len(self.slides) > 0 and self.current_slide < len(self.slides) - 1:
             if self.edit_mode:
                 self._finalize_offset_animation()
             self.current_slide += 1
-            self.animate_to_current_slide()
+            self._animate_slide_with_velocity(velocity)
             self.reset_navigation_timer()
             self.reset_clock_return_timer()
             self.update()
             self.update_active_webviews()
 
-    def previous_slide(self):
+    def previous_slide(self, velocity: float = 0):
         """Move to previous slide"""
         if len(self.slides) > 0 and self.current_slide > 0:
             if self.edit_mode:
                 self._finalize_offset_animation()
             self.current_slide -= 1
-            self.animate_to_current_slide()
+            self._animate_slide_with_velocity(velocity)
             self.reset_navigation_timer()
             self.reset_clock_return_timer()
             self.update()
             self.update_active_webviews()
+    
+    def _animate_slide_with_velocity(self, velocity: float = 0):
+        """Animate to current slide with duration based on swipe velocity"""
+        if len(self.slides) == 0:
+            return
+        
+        self.current_slide = max(0, min(self.current_slide, len(self.slides) - 1))
+        target_offset = -self.current_slide * self.width()
+        
+        if hasattr(self, 'offset_animation') and self.offset_animation:
+            # Faster swipe = shorter animation (more responsive feel)
+            if velocity > 800:
+                duration = 200
+            elif velocity > 500:
+                duration = 280
+            elif velocity > 300:
+                duration = 320
+            else:
+                duration = 350
+            
+            self.offset_animation.setEasingCurve(QEasingCurve.Type.OutExpo)
+            self.offset_animation.setDuration(duration)
+            self._start_property_animation(self.offset_animation, float(target_offset))
+        
+        self.update_active_webviews()
+        self.update()
 
     def get_embedded_card_geometry(self, slide_index: int = None) -> QRect:
         """Calculate geometry for embedded webview cards based on slide position
@@ -2865,8 +3151,9 @@ class NDotClockSlider(QWidget):
         # Use different easing for slide transitions in normal mode
         if not self.edit_mode:
             if hasattr(self, 'offset_animation') and self.offset_animation:
-                self.offset_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
-                self.offset_animation.setDuration(400)
+                # Smoother animation with OutExpo for snappy feel
+                self.offset_animation.setEasingCurve(QEasingCurve.Type.OutExpo)
+                self.offset_animation.setDuration(350)
         else:
             if hasattr(self, 'offset_animation') and self.offset_animation:
                 self.offset_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
@@ -3159,6 +3446,8 @@ class NDotClockSlider(QWidget):
         """Main paint event"""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
 
         # Background
         painter.fillRect(self.rect(), self.background_color)
@@ -3423,6 +3712,7 @@ class NDotClockSlider(QWidget):
 
             temp_painter = QPainter(pixmap)
             temp_painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            temp_painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
             center = size / 2
             self.draw_glow_dot(temp_painter, center, center, radius, color, with_highlight=with_highlight)
             temp_painter.end()
@@ -3556,6 +3846,7 @@ class NDotClockSlider(QWidget):
         # Render to pixmap
         pix_painter = QPainter(pixmap)
         pix_painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        pix_painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         pix_painter.setPen(Qt.PenStyle.NoPen)
 
         center_x = pixmap_size / 2
@@ -3766,12 +4057,26 @@ class NDotClockSlider(QWidget):
         
         current_y = start_y
         
-        # Get current brightness for icon opacity
-        current_brightness = self.brightness_manager.get_brightness()
+        # Use effective_brightness for consistent rendering (same as text)
+        # Hardware backlight or BrightnessOverlay handles actual dimming
+        current_brightness = self.effective_brightness
         
         sections_drawn = False
         line_gap = int(content_height * 0.05)
 
+        # Draw city name above icon
+        if hasattr(self, 'location_city') and self.location_city:
+            city_font_size = max(12, int(content_height * 0.055))
+            city_font = self._get_cached_font(self.font_family, city_font_size)
+            city_color = self._scale_color_by_brightness(QColor(150, 150, 150))
+            painter.setPen(city_color)
+            painter.setFont(city_font)
+            city_metrics = self._get_cached_fontmetrics(self.font_family, city_font_size)
+            city_height = city_metrics.height()
+            city_rect = QRect(start_x, current_y, content_width, city_height)
+            painter.drawText(city_rect, Qt.AlignmentFlag.AlignCenter, self.location_city)
+            current_y += city_height + line_gap // 2
+        
         if slide_data.get('show_icon', True):
             icon_height = max(60, int(content_height * 0.4))
             
@@ -4181,6 +4486,14 @@ class NDotClockSlider(QWidget):
         painter.setPen(text_color)
         painter.drawText(autostart_rect, Qt.AlignmentFlag.AlignCenter, self._tr("autostart_button"))
 
+        # WiFi button
+        wifi_rect = layout["wifi_rect"]
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(self._scale_color_by_brightness(QColor(50, 120, 180, 200)))
+        painter.drawRoundedRect(wifi_rect, radius, radius)
+        painter.setPen(self._scale_color_by_brightness(QColor(255, 255, 255)))
+        painter.drawText(wifi_rect, Qt.AlignmentFlag.AlignCenter, "WiFi")
+
     def save_settings(self):
         """Save settings to file"""
         settings = {
@@ -4190,7 +4503,7 @@ class NDotClockSlider(QWidget):
             'colon_color': self.colon_color,
             'language': self.current_language,
             'slides': self.slides,
-            'location': {'lat': self.location_lat, 'lon': self.location_lon},
+            'location': {'lat': self.location_lat, 'lon': self.location_lon, 'city': self.location_city},
             'fullscreen': self.is_fullscreen,
             'auto_brightness_enabled': self.brightness_manager.is_auto_enabled(),
             'auto_brightness_camera': self.brightness_manager._auto_brightness_camera_index,
